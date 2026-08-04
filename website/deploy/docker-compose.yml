@@ -1,0 +1,39 @@
+services:
+  sejbosejbo:
+    image: thekingziga/sejbosejbo:latest
+    container_name: sejbosejbo
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
+      SESSION_SECRET: "${SESSION_SECRET}"
+      # Donations (Stripe). Leave unset to keep /api/v1/donations/stripe/*
+      # returning 503 rather than crashing - fine until real keys exist.
+      STRIPE_SECRET_KEY: "${STRIPE_SECRET_KEY:-}"
+      STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET:-}"
+      # Donations (Apple in-app purchase, App Store Server API)
+      APPLE_IAP_KEY_ID: "${APPLE_IAP_KEY_ID:-}"
+      APPLE_IAP_ISSUER_ID: "${APPLE_IAP_ISSUER_ID:-}"
+      APPLE_IAP_PRIVATE_KEY: "${APPLE_IAP_PRIVATE_KEY:-}"
+      APPLE_BUNDLE_ID: "${APPLE_BUNDLE_ID:-fyi.sejbosejbo}"
+      APPLE_IAP_SANDBOX: "${APPLE_IAP_SANDBOX:-false}"
+      # Donations (Google Play Developer API)
+      GOOGLE_SERVICE_ACCOUNT_JSON: "${GOOGLE_SERVICE_ACCOUNT_JSON:-}"
+      GOOGLE_PACKAGE_NAME: "${GOOGLE_PACKAGE_NAME:-}"
+      # Universal / app links - both left unset serve 404 on the
+      # .well-known files, which just makes shared links open the website.
+      APPLE_TEAM_ID: "${APPLE_TEAM_ID:-}"
+      ANDROID_CERT_SHA256: "${ANDROID_CERT_SHA256:-}"
+      # Report notification email. Left unset, reports still work, just
+      # without an alert - the recipient address is set in /admin/settings.
+      SMTP_HOST: "${SMTP_HOST:-}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASS: "${SMTP_PASS:-}"
+      SMTP_FROM: "${SMTP_FROM:-}"
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads

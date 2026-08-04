@@ -1,0 +1,178 @@
+# sejbosejbo.fyi JSON API
+
+Base URL: `https://sejbosejbo.fyi/api/v1`
+
+Build the Flutter app with:
+
+```
+--dart-define=API_BASE_URL=https://sejbosejbo.fyi
+```
+
+(the app appends `/api/v1` itself).
+
+## Conventions
+
+- All responses are `application/json; charset=utf-8`.
+- Errors are `{"error": "human readable message"}` with the matching HTTP status.
+- `Cache-Control: no-store` on every response under `/api/v1` - don't cache
+  vote counts or feeds client-side beyond your own app state.
+- CORS is open (`Access-Control-Allow-Origin: *`) on `/api/v1` only. Native
+  builds don't need it; the Flutter web build does.
+- Timestamps are ISO 8601 UTC with a `Z` suffix, e.g. `2026-07-19T00:29:00Z`.
+- Image URLs are always absolute (`https://sejbosejbo.fyi/uploads/...`).
+- `lang` query param: `en` or `sl`, defaults to `en`. Drives `quote`,
+  `random-phrase`, and validation-error text.
+- No auth on any endpoint - the site is anonymous by design.
+
+## The Post object
+
+```json
+{
+  "id": 12,
+  "title": "Microwaved a salad",
+  "description": "It was warm. It was wrong.",
+  "kind": "image",
+  "image_url": "https://sejbosejbo.fyi/uploads/1784413785433-82067194ba2c0f24.jpg",
+  "featured": false,
+  "pinned": false,
+  "created_at": "2026-07-19T00:29:00Z",
+  "upvotes": 128,
+  "downvotes": 6
+}
+```
+
+- `kind` is `"image"` or `"story"`; `image_url` is `null` for text-only posts.
+- `description` is `null`, not `""`, when empty.
+- `featured` / `pinned` are real booleans.
+- Hidden posts never appear anywhere in this API.
+- `upvotes` / `downvotes` are raw counts - derive the score client-side as
+  `upvotes - downvotes`; the API doesn't send a precomputed score.
+
+## Reads
+
+### `GET /feed?lang=en`
+
+Everything the dashboard needs in one call. Does **not** increment the
+website's human visitor counter.
+
+```json
+{
+  "stats": { "visits": 1337, "uploads": 42, "days_since_last": 3 },
+  "quote": "That's a certified Sejbosejbo.",
+  "daily": { "...": "Post, or null" },
+  "posts": [ "4 newest visible Posts, pinned first" ],
+  "top": [ "3 highest (upvotes - downvotes) Posts of all time" ]
+}
+```
+
+`days_since_last` is `null` when there are no posts yet.
+
+### `GET /posts?page=1&per_page=24&sort=newest&lang=en`
+
+```json
+{ "items": [ "Posts" ], "page": 1, "per_page": 24, "has_next": true }
+```
+
+- `per_page` clamps to 50.
+- `page` beyond the end returns `items: []`, `has_next: false` - not a 404.
+- `sort`: `newest` (default, pinned first) | `top` (by score, `id` tie-break
+  for stable pagination) | `featured` (only `featured: true`, newest first).
+  Unknown values fall back to `newest`.
+
+### `GET /posts/:id`
+
+A single Post, or `404 {"error": "..."}`.
+
+### `GET /random-phrase?lang=en`
+
+```json
+{ "phrase": "Certified Sejbosejbo" }
+```
+
+## Writes
+
+### `POST /posts` — multipart/form-data
+
+- `title` - required, trimmed, max 120 chars.
+- `description` - optional, trimmed, max 1200 chars.
+- `image` - optional, jpeg/png/gif/webp, max 8 MB.
+- Need a title, and at least one of description or image.
+
+`201` with the created Post. `400 {"error": "..."}` on validation failure.
+**Rate limited: 5 uploads / 10 min per IP → `429`.**
+
+### `POST /posts/:id/vote`
+
+Header: `X-Device-Id: <a UUID or similar the app generates once and reuses>`
+(8-128 chars, `[A-Za-z0-9_-]`). Missing/malformed → `400`.
+
+Body:
+
+```json
+{ "value": 1 }
+```
+
+`1` = sej bo, `-1` = sej ne bo, `0` = withdraw. Anything else → `400`.
+
+Returns the **full updated Post** so the app can replace its optimistic
+guess with the real counts. One vote per `(post, device)` - voting again
+updates rather than duplicates.
+
+This is soft protection, not security: clearing app storage or forging the
+header lets anyone re-vote. Treat counts as indicative, not authoritative.
+**Rate limited: 60 votes / min per IP → `429`.**
+
+### `POST /posts/:id/report`
+
+Required by Google Play's User Generated Content policy and Apple's
+Guideline 1.2 - both require an in-app way to flag objectionable content.
+**The app must expose this**, not just the website.
+
+Body:
+
+```json
+{ "reason": "spam", "details": "optional, max 500 chars" }
+```
+
+`reason` is one of `spam` | `inappropriate` | `harassment` | `copyright` |
+`other`. Anything else → `400`. No `X-Device-Id` required - repeated
+reports from the same device are a legitimate stronger signal, not abuse.
+
+`201 {"ok": true}` on success, `404` if the post doesn't exist.
+**Rate limited: 20 reports / hour per IP → `429`.**
+
+Reports don't hide or remove anything automatically - they queue for a
+human (site admin) to review at `/admin?filter=reported`.
+
+## Donations
+
+- **iOS / Android / macOS**: use StoreKit / Play Billing, then confirm with
+  the app's server-side verify endpoints below - store policy requires this
+  and forbids linking out to Stripe from those builds.
+- **Windows**: Stripe Checkout in the browser.
+
+All three are **disabled (`503`) until the matching env vars are set** - see
+`deploy/.env.example`. Nothing to change in the app; they'll start working
+the moment the server is configured.
+
+### `POST /donations/stripe/session`
+
+Body: `{"tier_id": "small" | "medium" | "large"}` → `{"url": "https://checkout.stripe.com/..."}`
+
+Amounts (`small`=€2, `medium`=€5, `large`=€15) come from a server-side map -
+never trust a client-supplied amount.
+
+### `POST /donations/apple/verify` / `POST /donations/google/verify`
+
+Body: `{"product_id": "fyi.sejbosejbo.tip.small|medium|large", "token": "..."}`
+
+`200` on a verified purchase, `400` on a receipt that doesn't check out,
+`503` if that store's verification isn't configured yet.
+
+## Deep links
+
+`https://sejbosejbo.fyi/post/<id>` should open the app once it's registered.
+`GET /.well-known/apple-app-site-association` and
+`GET /.well-known/assetlinks.json` serve the association files once
+`APPLE_TEAM_ID` / `ANDROID_CERT_SHA256` are set; until then they `404` and
+shared links just open the website, which is a fine fallback.
