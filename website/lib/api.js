@@ -67,11 +67,12 @@ router.get("/posts", (req, res) => {
   if (!Number.isFinite(page) || page < 1) page = 1;
   const offset = (page - 1) * perPage;
 
-  const sort = ["newest", "top", "featured"].includes(req.query.sort) ? req.query.sort : "newest";
+  const sort = ["newest", "top", "featured", "pinned"].includes(req.query.sort) ? req.query.sort : "newest";
   const statement = {
-    newest: statements.pagedUploads,
+    newest: statements.pagedUploadsNewestApi,
     top: statements.pagedUploadsTop,
-    featured: statements.pagedUploadsFeatured
+    featured: statements.pagedUploadsFeatured,
+    pinned: statements.pagedUploadsPinned
   }[sort];
 
   const rows = statement.all(perPage + 1, offset);

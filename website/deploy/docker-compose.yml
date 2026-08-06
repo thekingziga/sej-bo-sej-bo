@@ -26,6 +26,7 @@ services:
       # Universal / app links - both left unset serve 404 on the
       # .well-known files, which just makes shared links open the website.
       APPLE_TEAM_ID: "${APPLE_TEAM_ID:-}"
+      ANDROID_PACKAGE_NAME: "${ANDROID_PACKAGE_NAME:-com.thekingziga.sejbosejbo}"
       ANDROID_CERT_SHA256: "${ANDROID_CERT_SHA256:-}"
       # Report notification email. Left unset, reports still work, just
       # without an alert - the recipient address is set in /admin/settings.

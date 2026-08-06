@@ -92,10 +92,19 @@ const statements = {
   resetVisits: db.prepare("UPDATE counters SET value = 0 WHERE key = 'visits'"),
   totalUploads: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0"),
   latestUpload: db.prepare("SELECT id, title, created_at FROM uploads WHERE hidden = 0 ORDER BY datetime(created_at) DESC, id DESC LIMIT 1"),
+  // Pinned-first ordering - used only by the website's own gallery/home
+  // pages, which have always shown pinned posts jumping the queue.
   newestUploads: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY pinned DESC, datetime(created_at) DESC, id DESC LIMIT ?"),
   pagedUploads: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY pinned DESC, datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
+  // Pure date ordering, no pinned bump - this is /api/v1/posts?sort=newest.
+  // A pinned post from weeks ago outranking today's post in a tab literally
+  // labelled "newest" reads as a bug to an app user, even though it's
+  // "working as configured" - so the API and the website intentionally
+  // disagree here.
+  pagedUploadsNewestApi: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
   pagedUploadsTop: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY (upvotes - downvotes) DESC, upvotes DESC, datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
   pagedUploadsFeatured: db.prepare("SELECT * FROM uploads WHERE hidden = 0 AND featured = 1 ORDER BY datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
+  pagedUploadsPinned: db.prepare("SELECT * FROM uploads WHERE hidden = 0 AND pinned = 1 ORDER BY datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
   topUploadsAllTime: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY (upvotes - downvotes) DESC, upvotes DESC, datetime(created_at) DESC, id DESC LIMIT ?"),
   allUploadsAdmin: db.prepare("SELECT * FROM uploads ORDER BY datetime(created_at) DESC, id DESC"),
   reportedUploadsAdmin: db.prepare("SELECT * FROM uploads WHERE report_count > 0 ORDER BY report_count DESC, datetime(created_at) DESC, id DESC"),

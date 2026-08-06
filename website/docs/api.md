@@ -75,9 +75,18 @@ website's human visitor counter.
 
 - `per_page` clamps to 50.
 - `page` beyond the end returns `items: []`, `has_next: false` - not a 404.
-- `sort`: `newest` (default, pinned first) | `top` (by score, `id` tie-break
-  for stable pagination) | `featured` (only `featured: true`, newest first).
-  Unknown values fall back to `newest`.
+- `sort`: `newest` (default, pure date order - **not** pinned-first, see
+  below) | `top` (by score, `id` tie-break for stable pagination) |
+  `featured` (only `featured: true`, newest first) | `pinned` (only
+  `pinned: true`, newest first). Unknown values fall back to `newest`.
+
+`pinned` stays in the Post object regardless of sort - it's just data, use it
+to show a badge. `sort=newest` deliberately ignores it: a 19-day-old pinned
+post outranking today's post in a tab labelled "newest" reads as broken to a
+user even though it's doing what pinning asked for. Pin something and it
+shows up in `sort=pinned`, not by jumping the newest queue. (The *website's*
+own `/gallery` page still shows pinned posts first on its default view -
+that's an intentional difference in the HTML, not a bug in the API.)
 
 ### `GET /posts/:id`
 
