@@ -18,7 +18,10 @@ USER node
 EXPOSE 3000
 VOLUME ["/app/data", "/app/uploads"]
 
+# Reads PORT rather than hardcoding 3000: server.js honours PORT, so a
+# deployment that sets it was silently reporting "unhealthy" forever while
+# the app was fine - the check was hitting a port nothing listened on.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "const p=process.env.PORT||3000;fetch('http://127.0.0.1:'+p+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "server.js"]
