@@ -231,6 +231,29 @@ button:hover,
 .meter-fill {
   height: 100%;
   background: linear-gradient(90deg, #4cff4c, #ff0, #ff0000);
+  transition: width 400ms ease-out;
+}
+
+/* Pegged at MAX earns a flashing bar. Respects reduced-motion below - a
+   full-width strobe is exactly the kind of thing that setting exists for. */
+.meter-fill.maxed {
+  animation: meter-alarm 900ms steps(2, end) infinite;
+}
+
+@keyframes meter-alarm {
+  0% { filter: none; }
+  50% { filter: saturate(2.2) brightness(1.25); }
+  100% { filter: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .meter-fill {
+    transition: none;
+  }
+
+  .meter-fill.maxed {
+    animation: none;
+  }
 }
 
 .app-badges {

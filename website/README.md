@@ -228,7 +228,7 @@ Published image:
 
 ```text
 thekingziga/sejbosejbo:latest
-thekingziga/sejbosejbo:1.5.0
+thekingziga/sejbosejbo:1.5.1
 ```
 
 The published tags are `linux/arm64` only, because the image is built natively on
@@ -243,11 +243,11 @@ rsync -av --exclude node_modules --exclude data --exclude uploads --exclude .git
 Then on the Pi, build and push:
 
 ```bash
-cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.5.0 -t thekingziga/sejbosejbo:latest .
+cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.5.1 -t thekingziga/sejbosejbo:latest .
 ```
 
 ```bash
-docker login && docker push thekingziga/sejbosejbo:1.5.0 && docker push thekingziga/sejbosejbo:latest
+docker login && docker push thekingziga/sejbosejbo:1.5.1 && docker push thekingziga/sejbosejbo:latest
 ```
 
 Because the build already leaves the image on the Pi, deploying needs no pull:
@@ -263,7 +263,7 @@ or OrbStack installed locally:
 
 ```bash
 docker buildx create --use --name sejbosejbo-builder
-docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.5.0 --push .
+docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.5.1 --push .
 ```
 
 If the Pi ever runs a 32-bit OS, add `linux/arm/v7`.

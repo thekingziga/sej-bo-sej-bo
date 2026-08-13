@@ -270,6 +270,13 @@ app.get("/", (req, res) => {
   const cards = newest.length ? newest.map((item) => renderCard(item, req)).join("") : `<p class="empty">${t.emptyHome}</p>`;
   const examples = ai.getExamples(getLang(req));
 
+  // The Sejbometer used to be a random 82-97% - decorative, and it never
+  // meant anything. Now it tracks the archive: it fills as uploads come in
+  // and pins at MAX from METER_TARGET onwards.
+  const uploadCount = statements.totalUploads.get().count;
+  const meterPercent = Math.min(Math.round((uploadCount / METER_TARGET) * 100), 100);
+  const meterMaxed = uploadCount >= METER_TARGET;
+
   renderPage(req, res, {
     title: t.homeTitle,
     body: `
@@ -292,8 +299,14 @@ app.get("/", (req, res) => {
 
       <section class="meter">
         <h2>${t.meterTitle}</h2>
-        <div class="meter-track"><div class="meter-fill" style="width:${82 + Math.floor(Math.random() * 16)}%"></div></div>
-        <p>${t.meterResult}</p>
+        <div class="meter-track" role="progressbar" aria-valuenow="${meterPercent}" aria-valuemin="0" aria-valuemax="100">
+          <div class="meter-fill${meterMaxed ? " maxed" : ""}" style="width:${meterPercent}%"></div>
+        </div>
+        <p>${
+          meterMaxed
+            ? t.meterResultMax
+            : t.meterResultBuilding.replace("{count}", uploadCount).replace("{needed}", METER_TARGET)
+        }</p>
       </section>
 
       <section>
@@ -330,6 +343,9 @@ app.get("/", (req, res) => {
     `
   });
 });
+
+// Uploads needed to peg the Sejbometer at MAX.
+const METER_TARGET = 6;
 
 const GALLERY_SORTS = {
   // "latest" means latest - no pinned bump. Pinned posts get their own tab
