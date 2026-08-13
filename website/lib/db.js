@@ -70,6 +70,19 @@ db.exec(`
     value TEXT NOT NULL DEFAULT ''
   );
 
+  -- Cache for Ollama-generated copy. Generation happens on a timer, never
+  -- during a request: a Pi 4 does CPU-only inference at a few tokens a
+  -- second, so generating inline would stall every page load. Pages read
+  -- this table (instant) and fall back to the static i18n arrays when a
+  -- row is missing.
+  CREATE TABLE IF NOT EXISTS ai_content (
+    key TEXT NOT NULL,
+    lang TEXT NOT NULL DEFAULT '',
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (key, lang)
+  );
+
   INSERT OR IGNORE INTO counters (key, value) VALUES ('reports_filed', 0);
 `);
 
@@ -105,6 +118,11 @@ const statements = {
   pagedUploadsTop: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY (upvotes - downvotes) DESC, upvotes DESC, datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
   pagedUploadsFeatured: db.prepare("SELECT * FROM uploads WHERE hidden = 0 AND featured = 1 ORDER BY datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
   pagedUploadsPinned: db.prepare("SELECT * FROM uploads WHERE hidden = 0 AND pinned = 1 ORDER BY datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
+  // Counts backing the numbered pager - it needs a total, not just
+  // "is there one more row after this page".
+  countVisible: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0"),
+  countFeatured: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0 AND featured = 1"),
+  countPinned: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0 AND pinned = 1"),
   topUploadsAllTime: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY (upvotes - downvotes) DESC, upvotes DESC, datetime(created_at) DESC, id DESC LIMIT ?"),
   allUploadsAdmin: db.prepare("SELECT * FROM uploads ORDER BY datetime(created_at) DESC, id DESC"),
   reportedUploadsAdmin: db.prepare("SELECT * FROM uploads WHERE report_count > 0 ORDER BY report_count DESC, datetime(created_at) DESC, id DESC"),
@@ -149,7 +167,14 @@ const statements = {
   setSetting: db.prepare(`
     INSERT INTO settings (key, value) VALUES (?, ?)
     ON CONFLICT (key) DO UPDATE SET value = excluded.value
-  `)
+  `),
+
+  getAiContent: db.prepare("SELECT value, updated_at FROM ai_content WHERE key = ? AND lang = ?"),
+  setAiContent: db.prepare(`
+    INSERT INTO ai_content (key, lang, value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT (key, lang) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+  `),
+  allAiContent: db.prepare("SELECT key, lang, value, updated_at FROM ai_content ORDER BY key, lang")
 };
 
 /** Casts (or withdraws, for value === 0) a vote and refreshes the denormalized

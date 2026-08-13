@@ -122,6 +122,74 @@ Report emails need SMTP credentials in `.env` (`SMTP_HOST`, `SMTP_USER`,
 reporting still works, it just won't email anyone; `/admin/settings` shows
 whether SMTP is currently configured.
 
+## AI Copy (Ollama)
+
+Optional. With `OLLAMA_HOST` unset the site uses the hand-written phrase
+lists in `lib/i18n.js` and behaves exactly as it always has - this is
+strictly additive.
+
+When enabled, a timer regenerates copy into the `ai_content` table and
+pages read the cached rows:
+
+| What | Refresh |
+|---|---|
+| Random Quote | every 3 hours |
+| Homepage examples (the yellow box) | every 3 hours |
+| SEJBOSEJBO button phrases | every 3 hours |
+| Today's Sejbosejbo Award | once a day, model picks from the newest 40 posts |
+
+**Nothing calls the model during a page request.** A Pi 4 does CPU-only
+inference at a few tokens a second, so generating inline would stall every
+page load. Generation happens on a timer; requests only ever read SQLite.
+
+Every failure path falls back to the static lists: no `OLLAMA_HOST`,
+unreachable server, malformed output, or a hallucinated post id all leave
+the site fully working. `/admin/settings` shows the current status, what
+was generated and when, and has manual regenerate buttons.
+
+### Setting it up on the Pi
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+```bash
+ollama pull qwen2.5:0.5b
+```
+
+Ollama binds to `127.0.0.1` by default, which a container cannot reach.
+Let it listen on the LAN:
+
+```bash
+sudo systemctl edit ollama
+```
+
+Add, then `sudo systemctl restart ollama`:
+
+```text
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+Environment="OLLAMA_KEEP_ALIVE=0"
+```
+
+`OLLAMA_KEEP_ALIVE=0` unloads the model straight after each generation, so
+it only occupies RAM for the seconds it is actually working - which matters
+on a Pi also running the website.
+
+Then in `.env` (use the Pi's LAN IP, not `127.0.0.1` - that would be the
+container itself):
+
+```text
+OLLAMA_HOST=http://192.168.69.13:11434
+OLLAMA_MODEL=qwen2.5:0.5b
+```
+
+Model choice: `qwen2.5:0.5b` (~400MB) is the safe default on a Pi 4.
+`llama3.2:1b` (~1.3GB) writes noticeably better lines if the RAM is spare.
+Expect weaker Slovenian than English from any model this small - the SL
+generations are worth reading before trusting them, and clearing the
+`ai_content` rows for `sl` falls back to the curated list.
+
 ## Docker
 
 Build locally:
@@ -160,7 +228,7 @@ Published image:
 
 ```text
 thekingziga/sejbosejbo:latest
-thekingziga/sejbosejbo:1.4.2
+thekingziga/sejbosejbo:1.5.0
 ```
 
 The published tags are `linux/arm64` only, because the image is built natively on
@@ -175,11 +243,11 @@ rsync -av --exclude node_modules --exclude data --exclude uploads --exclude .git
 Then on the Pi, build and push:
 
 ```bash
-cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.4.2 -t thekingziga/sejbosejbo:latest .
+cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.5.0 -t thekingziga/sejbosejbo:latest .
 ```
 
 ```bash
-docker login && docker push thekingziga/sejbosejbo:1.4.2 && docker push thekingziga/sejbosejbo:latest
+docker login && docker push thekingziga/sejbosejbo:1.5.0 && docker push thekingziga/sejbosejbo:latest
 ```
 
 Because the build already leaves the image on the Pi, deploying needs no pull:
@@ -195,7 +263,7 @@ or OrbStack installed locally:
 
 ```bash
 docker buildx create --use --name sejbosejbo-builder
-docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.4.2 --push .
+docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.5.0 --push .
 ```
 
 If the Pi ever runs a 32-bit OS, add `linux/arm/v7`.

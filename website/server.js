@@ -22,6 +22,7 @@ const apiRouter = require("./lib/api");
 const wellKnownRouter = require("./lib/wellKnown");
 const donations = require("./lib/donations");
 const { getNotifyEmail, setNotifyEmail } = require("./lib/mail");
+const ai = require("./lib/ai");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -93,7 +94,7 @@ function getStats(req) {
     uploads: statements.totalUploads.get().count,
     latest,
     daily,
-    quote: t.quotes[Math.floor(Math.random() * t.quotes.length)]
+    quote: (() => { const q = ai.getQuotes(getLang(req)); return q[Math.floor(Math.random() * q.length)]; })()
   };
 }
 
@@ -267,6 +268,7 @@ app.get("/", (req, res) => {
   const t = getCopy(req);
   const newest = statements.newestUploads.all(8);
   const cards = newest.length ? newest.map((item) => renderCard(item, req)).join("") : `<p class="empty">${t.emptyHome}</p>`;
+  const examples = ai.getExamples(getLang(req));
 
   renderPage(req, res, {
     title: t.homeTitle,
@@ -277,10 +279,8 @@ app.get("/", (req, res) => {
       </section>
 
       <section class="examples">
-        <p>${t.examples[0]}</p>
-        <p>${t.examples[1]}</p>
-        <p>${t.examples[2]}</p>
-        <p><b>${t.examples[3]}</b></p>
+        ${examples.slice(0, -1).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}
+        <p><b>${escapeHtml(examples[examples.length - 1])}</b></p>
       </section>
 
       <section class="counter-box">${t.visitorLine} #${getTotalVisits().toLocaleString("en-US")}</section>
@@ -331,24 +331,70 @@ app.get("/", (req, res) => {
   });
 });
 
+const GALLERY_SORTS = {
+  // "latest" means latest - no pinned bump. Pinned posts get their own tab
+  // rather than jumping the queue, matching how the API behaves.
+  latest: { statement: "pagedUploadsNewestApi", count: "countVisible" },
+  top: { statement: "pagedUploadsTop", count: "countVisible" },
+  featured: { statement: "pagedUploadsFeatured", count: "countFeatured" },
+  pinned: { statement: "pagedUploadsPinned", count: "countPinned" }
+};
+
+/** Page numbers with ellipsis, e.g.  < 1 ... 4 [5] 6 ... 12 >
+ * Always shows first/last so you can jump to either end from anywhere. */
+function renderPager(current, totalPages, hrefFor, t) {
+  if (totalPages <= 1) return "";
+
+  const numbers = new Set([1, totalPages, current]);
+  for (let offset = 1; offset <= 2; offset += 1) {
+    if (current - offset >= 1) numbers.add(current - offset);
+    if (current + offset <= totalPages) numbers.add(current + offset);
+  }
+  const sorted = [...numbers].sort((a, b) => a - b);
+
+  const parts = [];
+  parts.push(current > 1
+    ? `<a class="pager-step" href="${hrefFor(current - 1)}" rel="prev" aria-label="${t.pagerPrev}">&lsaquo;</a>`
+    : `<span class="pager-step disabled" aria-hidden="true">&lsaquo;</span>`);
+
+  let previous = 0;
+  for (const number of sorted) {
+    if (number - previous > 1) parts.push(`<span class="pager-gap">&hellip;</span>`);
+    parts.push(number === current
+      ? `<span class="pager-page active" aria-current="page">${number}</span>`
+      : `<a class="pager-page" href="${hrefFor(number)}">${number}</a>`);
+    previous = number;
+  }
+
+  parts.push(current < totalPages
+    ? `<a class="pager-step" href="${hrefFor(current + 1)}" rel="next" aria-label="${t.pagerNext}">&rsaquo;</a>`
+    : `<span class="pager-step disabled" aria-hidden="true">&rsaquo;</span>`);
+
+  return `<nav class="pager" aria-label="Pagination">${parts.join("")}</nav>`;
+}
+
 app.get("/gallery", (req, res) => {
   const t = getCopy(req);
-  const page = Math.max(Number(req.query.page || 1), 1);
   const perPage = 24;
-  const sort = ["newest", "top", "featured"].includes(req.query.sort) ? req.query.sort : "newest";
-  const statement = {
-    newest: statements.pagedUploads,
-    top: statements.pagedUploadsTop,
-    featured: statements.pagedUploadsFeatured
-  }[sort];
-  const rows = statement.all(perPage + 1, (page - 1) * perPage);
-  const hasNext = rows.length > perPage;
-  const visible = rows.slice(0, perPage);
+  const sort = Object.hasOwn(GALLERY_SORTS, req.query.sort) ? req.query.sort : "latest";
+  const { statement, count } = GALLERY_SORTS[sort];
 
-  const sortLink = (value, label) => {
-    const href = withLang(req, `/gallery${value === "newest" ? "" : `?sort=${value}`}`);
-    return `<a class="${sort === value ? "active" : ""}" href="${href}">${label}</a>`;
+  const total = statements[count].get().count;
+  const totalPages = Math.max(Math.ceil(total / perPage), 1);
+  // Clamp instead of 404ing: a stale bookmark from before posts were
+  // deleted should land on the last real page, not an error.
+  const page = Math.min(Math.max(Number(req.query.page || 1) || 1, 1), totalPages);
+
+  const visible = statements[statement].all(perPage, (page - 1) * perPage);
+
+  const query = (params) => {
+    const parts = Object.entries(params).filter(([, v]) => v !== null && v !== undefined);
+    return parts.length ? `?${parts.map(([k, v]) => `${k}=${v}`).join("&")}` : "";
   };
+  const sortLink = (value, label) =>
+    `<a class="${sort === value ? "active" : ""}" href="${withLang(req, `/gallery${query({ sort: value === "latest" ? null : value })}`)}">${label}</a>`;
+  const pageHref = (number) =>
+    withLang(req, `/gallery${query({ sort: sort === "latest" ? null : sort, page: number === 1 ? null : number })}`);
 
   renderPage(req, res, {
     title: t.galleryTitle,
@@ -358,15 +404,14 @@ app.get("/gallery", (req, res) => {
         <p>${t.gallerySub}</p>
       </section>
       <nav class="sort-switch" aria-label="Sort">
-        ${sortLink("newest", t.sortNewest)}
+        ${sortLink("latest", t.sortLatest)}
         ${sortLink("top", t.sortTop)}
         ${sortLink("featured", t.sortFeatured)}
+        ${sortLink("pinned", t.sortPinned)}
       </nav>
       <div class="grid">${visible.length ? visible.map((item) => renderCard(item, req)).join("") : `<p class="empty">${t.emptyGallery}</p>`}</div>
-      <nav class="pager">
-        ${page > 1 ? `<a href="${withLang(req, `/gallery?page=${page - 1}${sort === "newest" ? "" : `&sort=${sort}`}`)}">${t.newer}</a>` : ""}
-        ${hasNext ? `<a href="${withLang(req, `/gallery?page=${page + 1}${sort === "newest" ? "" : `&sort=${sort}`}`)}">${t.older}</a>` : ""}
-      </nav>
+      ${renderPager(page, totalPages, pageHref, t)}
+      ${total > 0 ? `<p class="pager-summary">${t.pagerSummary.replace("{page}", page).replace("{total}", totalPages).replace("{count}", total.toLocaleString("en-US"))}</p>` : ""}
     `
   });
 });
@@ -686,6 +731,8 @@ app.get("/admin/metrics", requireAdmin, (req, res) => {
 app.get("/admin/settings", requireAdmin, (req, res) => {
   const t = getCopy(req);
   const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+  const aiConfig = ai.describeConfig();
+  const aiRows = statements.allAiContent.all();
 
   renderPage(req, res, {
     title: t.settingsPageHeading,
@@ -701,12 +748,58 @@ app.get("/admin/settings", requireAdmin, (req, res) => {
         <p class="smtp-status">${smtpConfigured ? t.smtpConfigured : t.smtpNotConfigured}</p>
         <button type="submit">${t.save}</button>
       </form>
+
+      <section class="plain-head"><h2>${t.aiHeading}</h2></section>
+      <div class="ai-panel">
+        <p class="smtp-status">${
+          aiConfig.enabled
+            ? t.aiConfigured.replace("{model}", escapeHtml(aiConfig.model)).replace("{host}", escapeHtml(aiConfig.host))
+            : t.aiNotConfigured
+        }</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>${t.aiColumnKey}</th><th>${t.aiColumnLang}</th><th>${t.aiColumnUpdated}</th><th>${t.aiColumnPreview}</th></tr></thead>
+            <tbody>${
+              aiRows.length
+                ? aiRows.map((row) => `
+                    <tr>
+                      <td>${escapeHtml(row.key)}</td>
+                      <td>${escapeHtml(row.lang || "-")}</td>
+                      <td>${formatDate(row.updated_at)}</td>
+                      <td class="ai-preview">${escapeHtml(row.value.slice(0, 120))}${row.value.length > 120 ? "&hellip;" : ""}</td>
+                    </tr>
+                  `).join("")
+                : `<tr><td colspan="4">${t.aiNoContent}</td></tr>`
+            }</tbody>
+          </table>
+        </div>
+        ${aiConfig.enabled ? `
+          <form method="post" action="${withLang(req, "/admin/ai/regenerate")}" class="inline-form">
+            <button type="submit" name="what" value="content">${t.aiRegenerateContent}</button>
+            <button type="submit" name="what" value="award">${t.aiRegenerateAward}</button>
+          </form>
+          <p class="smtp-status">${t.aiRegenerateNote}</p>
+        ` : ""}
+      </div>
     `
   });
 });
 
 app.post("/admin/settings", requireAdmin, (req, res) => {
   setNotifyEmail(String(req.body.notify_email || "").trim().slice(0, 200));
+  res.redirect(withLang(req, "/admin/settings"));
+});
+
+app.post("/admin/ai/regenerate", requireAdmin, (req, res) => {
+  // Kicked off in the background and redirected immediately: on a Pi this
+  // takes minutes, and holding the admin's request open that long would
+  // just time out somewhere in the proxy chain.
+  const what = req.body.what === "award" ? "award" : "content";
+  if (what === "award") {
+    ai.refreshAward({ force: true }).catch((err) => console.error("[ai]", err.message));
+  } else {
+    ai.refreshContent({ force: true }).catch((err) => console.error("[ai]", err.message));
+  }
   res.redirect(withLang(req, "/admin/settings"));
 });
 
@@ -755,7 +848,8 @@ app.post("/admin/upload/:id/clear-reports", requireAdmin, (req, res) => {
 
 app.get("/api/random-phrase", (req, res) => {
   const t = getCopy(req);
-  res.json({ phrase: t.phrases[Math.floor(Math.random() * t.phrases.length)] });
+  const phrases = ai.getPhrases(getLang(req));
+  res.json({ phrase: phrases[Math.floor(Math.random() * phrases.length)] });
 });
 
 app.get("/health", (req, res) => {
@@ -791,4 +885,5 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
   console.log(`sejbosejbo.fyi running at http://localhost:${PORT}`);
+  ai.start();
 });

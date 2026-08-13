@@ -58,7 +58,15 @@ function getTotalVisits() {
   return statements.totalVisits.get().value;
 }
 
+/** Today's award. Prefers the AI's pick when there is a fresh one for
+ * today, otherwise the original deterministic date-hash choice - which is
+ * also what runs whenever Ollama is off, hasn't caught up yet, or picked a
+ * post that has since been hidden or deleted. Required lazily so lib/ai.js
+ * can keep depending on this module without a cycle. */
 function getDailyUpload() {
+  const aiPick = require("./ai").getDailyAwardPost();
+  if (aiPick) return aiPick;
+
   const rows = statements.dailyPool.all();
   if (!rows.length) return null;
   const stamp = new Date().toISOString().slice(0, 10);

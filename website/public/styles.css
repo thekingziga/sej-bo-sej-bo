@@ -108,10 +108,15 @@ main {
   background: transparent;
   color: var(--text);
   cursor: pointer;
-  font: 900 clamp(48px, 13vw, 168px) var(--font-bad);
+  /* Capped at 158px, not 168px: "SEJBOSEJBO" renders ~6.82x its font-size
+     wide, so 168px needed 1135px of room inside a 1100px container and
+     wrapped a lone "O" onto its own line. 158px x 6.82 = 1078px, which
+     fits with margin to spare, and nowrap makes any future overflow shrink
+     the page rather than silently break the word again. */
+  font: 900 min(13vw, 158px) var(--font-bad);
   line-height: 0.9;
   letter-spacing: 0;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
   box-shadow: none;
   padding: 0;
 }
@@ -338,7 +343,10 @@ button:hover,
 .post-image {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  /* contain, not cover: the whole image has to be visible in the preview.
+     cover fills the square by cropping, which decapitated tall screenshots
+     and hid the punchline of wide ones. */
+  object-fit: contain;
   display: block;
 }
 
@@ -593,16 +601,69 @@ textarea {
 }
 
 .pager {
+  display: flex;
+  flex-wrap: wrap;
   justify-content: center;
-  margin: 28px 0;
+  align-items: center;
+  gap: 6px;
+  margin: 28px 0 10px;
 }
 
-.pager a {
+.pager-page,
+.pager-step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 6px 10px;
   border: 3px solid var(--line);
-  padding: 8px 14px;
+  background: #fff;
   color: var(--text);
-  background: var(--hot);
+  font-weight: 900;
   text-decoration: none;
+}
+
+.pager-page.active {
+  background: var(--hot);
+  box-shadow: 3px 3px 0 var(--line);
+}
+
+.pager-page:hover,
+.pager-step:hover {
+  background: var(--cyan);
+}
+
+.pager-step.disabled {
+  opacity: 0.35;
+  background: #fff;
+}
+
+.pager-step.disabled:hover {
+  background: #fff;
+}
+
+.pager-gap {
+  padding: 0 2px;
+  font-weight: 900;
+}
+
+.pager-summary {
+  text-align: center;
+  font-size: 14px;
+  opacity: 0.75;
+  margin: 0 0 28px;
+}
+
+.ai-panel {
+  max-width: 900px;
+  margin: 0 auto 30px;
+}
+
+.ai-preview {
+  font-size: 12px;
+  opacity: 0.85;
+  max-width: 420px;
 }
 
 .table-wrap {

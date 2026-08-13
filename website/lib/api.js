@@ -5,6 +5,7 @@ const express = require("express");
 const i18n = require("./i18n");
 const { statements, castVote, fileReport } = require("./db");
 const { sendReportNotification } = require("./mail");
+const ai = require("./ai");
 const { getOrigin, getTotalVisits, getDailyUpload, daysSince } = require("./util");
 const { getClientIp } = require("./ip");
 const { createRateLimiter } = require("./rateLimit");
@@ -49,7 +50,7 @@ router.get("/feed", (req, res) => {
       uploads: statements.totalUploads.get().count,
       days_since_last: daysSince(latest?.created_at)
     },
-    quote: copy.quotes[Math.floor(Math.random() * copy.quotes.length)],
+    quote: (() => { const q = ai.getQuotes(lang); return q[Math.floor(Math.random() * q.length)]; })(),
     daily: dailyRow ? serializePost(dailyRow, origin) : null,
     posts,
     top
@@ -89,8 +90,8 @@ router.get("/posts/:id", (req, res) => {
 });
 
 router.get("/random-phrase", (req, res) => {
-  const copy = i18n[getLangParam(req)];
-  res.json({ phrase: copy.phrases[Math.floor(Math.random() * copy.phrases.length)] });
+  const phrases = ai.getPhrases(getLangParam(req));
+  res.json({ phrase: phrases[Math.floor(Math.random() * phrases.length)] });
 });
 
 // --------------------------------------------------------------- upload ---
