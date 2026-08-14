@@ -121,6 +121,10 @@ const statements = {
   // Counts backing the numbered pager - it needs a total, not just
   // "is there one more row after this page".
   countVisible: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0"),
+  // Uploads so far today, for the Sejbometer. created_at is stored as UTC
+  // and date('now') is UTC too, so the day rolls over at midnight UTC -
+  // which is 01:00/02:00 in Slovenia, not local midnight.
+  countUploadsToday: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0 AND date(created_at) = date('now')"),
   countFeatured: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0 AND featured = 1"),
   countPinned: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0 AND pinned = 1"),
   topUploadsAllTime: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY (upvotes - downvotes) DESC, upvotes DESC, datetime(created_at) DESC, id DESC LIMIT ?"),

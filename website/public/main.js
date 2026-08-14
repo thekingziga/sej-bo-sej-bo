@@ -178,6 +178,39 @@ document.querySelectorAll("[data-report-widget]").forEach((widget) => {
   });
 });
 
+// --- Admin connection tests --------------------------------------------------
+
+// Both tests can be genuinely slow - a cold Ollama model load or an SMTP
+// handshake to a far-away server - so the button reports busy state and
+// stays disabled until the answer lands.
+document.querySelectorAll("[data-test]").forEach((button) => {
+  const kind = button.dataset.test;
+  const output = document.querySelector(`[data-test-result="${kind}"]`);
+  const idleLabel = button.textContent;
+  const endpoint = kind === "ai" ? "/admin/ai/test" : "/admin/smtp/test";
+
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    button.textContent = button.dataset.busy || "...";
+    output.textContent = "";
+    output.className = "test-result";
+
+    try {
+      const response = await fetch(endpoint, { method: "POST" });
+      const data = await response.json();
+      output.textContent = data.message || (data.ok ? "OK" : "Failed.");
+      output.classList.add(data.ok ? "ok" : "bad");
+    } catch {
+      const copy = window.SEJBOSEJBO_COPY || {};
+      output.textContent = copy.testFailedGeneric || "Test failed - the server didn't respond.";
+      output.classList.add("bad");
+    } finally {
+      button.disabled = false;
+      button.textContent = idleLabel;
+    }
+  });
+});
+
 // --- App platform badges (coming soon) --------------------------------------
 
 document.querySelectorAll("[data-app-badge]").forEach((badge) => {

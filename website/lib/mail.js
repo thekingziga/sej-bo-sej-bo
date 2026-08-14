@@ -64,4 +64,42 @@ async function sendReportNotification({ post, reason, details }) {
   }
 }
 
-module.exports = { getNotifyEmail, setNotifyEmail, sendReportNotification };
+/** Sends a real email to the configured address. Unlike the report
+ * notification this one reports failures back to the caller - the whole
+ * point is to surface a broken config, so a silent success would be
+ * useless. Errors are returned as text rather than thrown. */
+async function sendTestEmail() {
+  const to = getNotifyEmail();
+  if (!to) {
+    return { ok: false, message: "No notify email set. Save one above first." };
+  }
+
+  const transport = getTransporter();
+  if (!transport) {
+    return {
+      ok: false,
+      message: "SMTP isn't configured - set SMTP_HOST, SMTP_USER and SMTP_PASS in .env, then recreate the container."
+    };
+  }
+
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  try {
+    await transport.sendMail({
+      from,
+      to,
+      subject: "sejbosejbo.fyi: test email",
+      text: [
+        "This is a test from the sejbosejbo.fyi admin panel.",
+        "",
+        "If you're reading this, report notifications will reach you.",
+        `Sent: ${new Date().toISOString()}`
+      ].join("\n")
+    });
+    return { ok: true, message: `Sent to ${to}. Check that inbox (and the spam folder).` };
+  } catch (err) {
+    console.error("Test email failed:", err.message);
+    return { ok: false, message: `Send failed: ${String(err.message).slice(0, 300)}` };
+  }
+}
+
+module.exports = { getNotifyEmail, setNotifyEmail, sendReportNotification, sendTestEmail };

@@ -242,6 +242,78 @@ function getDailyAwardPost() {
   }
 }
 
+// ----------------------------------------------------------- self-test ---
+
+/** Walks the three things that can independently be wrong - reachable,
+ * model present, model actually generates - and reports which step failed
+ * rather than a single unhelpful "it didn't work". */
+async function testConnection() {
+  if (!isEnabled()) {
+    return { ok: false, step: "config", message: "OLLAMA_HOST is not set." };
+  }
+
+  const base = OLLAMA_HOST.replace(/\/$/, "");
+  const started = Date.now();
+
+  let tags;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    const response = await fetch(`${base}/api/tags`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!response.ok) {
+      return { ok: false, step: "reach", message: `${base} answered ${response.status}.` };
+    }
+    tags = await response.json();
+  } catch (err) {
+    return {
+      ok: false,
+      step: "reach",
+      message: `Could not reach ${base} (${err.name === "AbortError" ? "timed out" : err.message}). ` +
+        `From inside the container 127.0.0.1 is the container itself - use the Pi's LAN IP.`
+    };
+  }
+
+  const models = (tags.models || []).map((m) => m.name);
+  // Ollama reports "qwen2.5:0.5b"; tolerate a configured name without the tag.
+  const hasModel = models.some((name) => name === OLLAMA_MODEL || name.split(":")[0] === OLLAMA_MODEL.split(":")[0]);
+  if (!hasModel) {
+    return {
+      ok: false,
+      step: "model",
+      message: `Reachable, but "${OLLAMA_MODEL}" isn't installed. Available: ${models.join(", ") || "none"}. Run: ollama pull ${OLLAMA_MODEL}`
+    };
+  }
+
+  try {
+    const raw = await callOllama(
+      'Reply with only this JSON and nothing else: {"ok":true}',
+      { json: true }
+    );
+    const parsed = extractJson(raw);
+    const seconds = ((Date.now() - started) / 1000).toFixed(1);
+    if (!parsed) {
+      return {
+        ok: false,
+        step: "generate",
+        message: `Model responded in ${seconds}s but the output wasn't usable JSON: ${raw.slice(0, 120)}`
+      };
+    }
+    return {
+      ok: true,
+      step: "generate",
+      message: `Working. ${OLLAMA_MODEL} responded in ${seconds}s.`,
+      models
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      step: "generate",
+      message: `Model is installed but generation failed: ${err.name === "AbortError" ? `timed out after ${OLLAMA_TIMEOUT_MS / 1000}s` : err.message}`
+    };
+  }
+}
+
 // ----------------------------------------------------------- scheduling ---
 
 let running = false;
@@ -318,6 +390,7 @@ function start() {
 module.exports = {
   isEnabled,
   describeConfig,
+  testConnection,
   getQuotes,
   getPhrases,
   getExamples,

@@ -689,6 +689,43 @@ textarea {
   max-width: 420px;
 }
 
+.test-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  max-width: 900px;
+  margin: 12px auto 18px;
+}
+
+.test-btn {
+  font-size: 14px;
+  padding: 7px 12px;
+  box-shadow: 3px 3px 0 var(--line);
+  white-space: nowrap;
+}
+
+.test-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.test-result {
+  font-size: 13px;
+  font-weight: 900;
+  /* Diagnostics run long - "model X isn't installed, available: ..." needs
+     to wrap rather than run off the side of the panel. */
+  overflow-wrap: anywhere;
+}
+
+.test-result.ok {
+  color: #0a7a2f;
+}
+
+.test-result.bad {
+  color: #b30000;
+}
+
 .table-wrap {
   overflow-x: auto;
   margin: 18px 0;

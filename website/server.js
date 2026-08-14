@@ -21,7 +21,7 @@ const { upload } = require("./lib/upload");
 const apiRouter = require("./lib/api");
 const wellKnownRouter = require("./lib/wellKnown");
 const donations = require("./lib/donations");
-const { getNotifyEmail, setNotifyEmail } = require("./lib/mail");
+const { getNotifyEmail, setNotifyEmail, sendTestEmail } = require("./lib/mail");
 const ai = require("./lib/ai");
 
 const app = express();
@@ -186,7 +186,8 @@ function layout({ title, body, stats, req }) {
       voteFailed: t.voteFailed,
       reportSubmitted: t.reportSubmitted,
       reportFailed: t.reportFailed,
-      appComingSoonMessage: t.appComingSoonMessage
+      appComingSoonMessage: t.appComingSoonMessage,
+      testFailedGeneric: t.testFailedGeneric
     })};
   </script>
   <script src="/public/main.js"></script>
@@ -201,6 +202,14 @@ function renderPage(req, res, options) {
 function requireAdmin(req, res, next) {
   if (req.session.isAdmin) return next();
   return res.redirect(withLang(req, "/admin"));
+}
+
+/** JSON-flavoured admin guard. The HTML one redirects, which a fetch()
+ * would silently follow and hand back a login page as if it were a
+ * result - a 401 says what actually happened. */
+function requireAdminJson(req, res, next) {
+  if (req.session.isAdmin) return next();
+  return res.status(401).json({ ok: false, message: "Not signed in." });
 }
 
 function adminNav(req, active) {
@@ -270,10 +279,11 @@ app.get("/", (req, res) => {
   const cards = newest.length ? newest.map((item) => renderCard(item, req)).join("") : `<p class="empty">${t.emptyHome}</p>`;
   const examples = ai.getExamples(getLang(req));
 
-  // The Sejbometer used to be a random 82-97% - decorative, and it never
-  // meant anything. Now it tracks the archive: it fills as uploads come in
-  // and pins at MAX from METER_TARGET onwards.
-  const uploadCount = statements.totalUploads.get().count;
+  // The Sejbometer measures TODAY, not the whole archive - an all-time
+  // count would sit pegged at MAX forever once the archive got past six
+  // and stop meaning anything. This way it empties overnight and fills as
+  // the day's uploads come in.
+  const uploadCount = statements.countUploadsToday.get().count;
   const meterPercent = Math.min(Math.round((uploadCount / METER_TARGET) * 100), 100);
   const meterMaxed = uploadCount >= METER_TARGET;
 
@@ -305,7 +315,9 @@ app.get("/", (req, res) => {
         <p>${
           meterMaxed
             ? t.meterResultMax
-            : t.meterResultBuilding.replace("{count}", uploadCount).replace("{needed}", METER_TARGET)
+            : uploadCount === 0
+              ? t.meterResultEmpty
+              : t.meterResultBuilding.replace("{count}", uploadCount).replace("{needed}", METER_TARGET)
         }</p>
       </section>
 
@@ -764,6 +776,10 @@ app.get("/admin/settings", requireAdmin, (req, res) => {
         <p class="smtp-status">${smtpConfigured ? t.smtpConfigured : t.smtpNotConfigured}</p>
         <button type="submit">${t.save}</button>
       </form>
+      <div class="test-row">
+        <button type="button" class="test-btn" data-test="smtp" data-busy="${t.smtpTesting}">${t.smtpTest}</button>
+        <output class="test-result" data-test-result="smtp" role="status"></output>
+      </div>
 
       <section class="plain-head"><h2>${t.aiHeading}</h2></section>
       <div class="ai-panel">
@@ -772,6 +788,10 @@ app.get("/admin/settings", requireAdmin, (req, res) => {
             ? t.aiConfigured.replace("{model}", escapeHtml(aiConfig.model)).replace("{host}", escapeHtml(aiConfig.host))
             : t.aiNotConfigured
         }</p>
+        <div class="test-row">
+          <button type="button" class="test-btn" data-test="ai" data-busy="${t.aiTesting}">${t.aiTest}</button>
+          <output class="test-result" data-test-result="ai" role="status"></output>
+        </div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>${t.aiColumnKey}</th><th>${t.aiColumnLang}</th><th>${t.aiColumnUpdated}</th><th>${t.aiColumnPreview}</th></tr></thead>
@@ -804,6 +824,24 @@ app.get("/admin/settings", requireAdmin, (req, res) => {
 app.post("/admin/settings", requireAdmin, (req, res) => {
   setNotifyEmail(String(req.body.notify_email || "").trim().slice(0, 200));
   res.redirect(withLang(req, "/admin/settings"));
+});
+
+app.post("/admin/ai/test", requireAdminJson, async (req, res) => {
+  try {
+    res.json(await ai.testConnection());
+  } catch (err) {
+    console.error("[ai] test:", err.message);
+    res.json({ ok: false, message: `Test threw: ${String(err.message).slice(0, 200)}` });
+  }
+});
+
+app.post("/admin/smtp/test", requireAdminJson, async (req, res) => {
+  try {
+    res.json(await sendTestEmail());
+  } catch (err) {
+    console.error("[mail] test:", err.message);
+    res.json({ ok: false, message: `Test threw: ${String(err.message).slice(0, 200)}` });
+  }
 });
 
 app.post("/admin/ai/regenerate", requireAdmin, (req, res) => {

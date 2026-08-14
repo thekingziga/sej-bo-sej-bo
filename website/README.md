@@ -120,7 +120,9 @@ Notes:
 Report emails need SMTP credentials in `.env` (`SMTP_HOST`, `SMTP_USER`,
 `SMTP_PASS` at minimum) - see `deploy/.env.example`. Leave them unset and
 reporting still works, it just won't email anyone; `/admin/settings` shows
-whether SMTP is currently configured.
+whether SMTP is currently configured, and **send test email** delivers a
+real message to that address so you can confirm the whole chain works
+rather than waiting for a real report.
 
 ## AI Copy (Ollama)
 
@@ -145,7 +147,10 @@ page load. Generation happens on a timer; requests only ever read SQLite.
 Every failure path falls back to the static lists: no `OLLAMA_HOST`,
 unreachable server, malformed output, or a hallucinated post id all leave
 the site fully working. `/admin/settings` shows the current status, what
-was generated and when, and has manual regenerate buttons.
+was generated and when, and has manual regenerate buttons plus a **test
+connection** button. That test reports which of the three independent
+things failed - unreachable host, model not pulled, or generation itself -
+instead of a single unhelpful "didn't work".
 
 ### Setting it up on the Pi
 
@@ -228,7 +233,7 @@ Published image:
 
 ```text
 thekingziga/sejbosejbo:latest
-thekingziga/sejbosejbo:1.5.1
+thekingziga/sejbosejbo:1.6.0
 ```
 
 The published tags are `linux/arm64` only, because the image is built natively on
@@ -243,11 +248,11 @@ rsync -av --exclude node_modules --exclude data --exclude uploads --exclude .git
 Then on the Pi, build and push:
 
 ```bash
-cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.5.1 -t thekingziga/sejbosejbo:latest .
+cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.6.0 -t thekingziga/sejbosejbo:latest .
 ```
 
 ```bash
-docker login && docker push thekingziga/sejbosejbo:1.5.1 && docker push thekingziga/sejbosejbo:latest
+docker login && docker push thekingziga/sejbosejbo:1.6.0 && docker push thekingziga/sejbosejbo:latest
 ```
 
 Because the build already leaves the image on the Pi, deploying needs no pull:
@@ -263,7 +268,7 @@ or OrbStack installed locally:
 
 ```bash
 docker buildx create --use --name sejbosejbo-builder
-docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.5.1 --push .
+docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.6.0 --push .
 ```
 
 If the Pi ever runs a 32-bit OS, add `linux/arm/v7`.
