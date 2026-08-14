@@ -1,9 +1,8 @@
-const fs = require("fs");
-
 const express = require("express");
 
 const i18n = require("./i18n");
-const { statements, castVote, castCommentVote, fileReport, addComment } = require("./db");
+const { statements, castVote, castCommentVote, fileReport, addComment, postVotesByDevice, commentVotesByDevice } = require("./db");
+const storage = require("./storage");
 const { sendReportNotification } = require("./mail");
 const ai = require("./ai");
 const { getOrigin, getTotalVisits, getDailyUpload, daysSince, toIsoUtc } = require("./util");
@@ -20,6 +19,22 @@ const REPORT_REASONS = ["spam", "inappropriate", "harassment", "copyright", "oth
 
 function getLangParam(req) {
   return req.query.lang === "sl" ? "sl" : "en";
+}
+
+/** The caller's device id, or null when absent/malformed. Reads never
+ * require it - it only unlocks the my_vote field. */
+function getDeviceId(req) {
+  const raw = req.headers["x-device-id"];
+  return typeof raw === "string" && DEVICE_ID_RE.test(raw) ? raw : null;
+}
+
+/** Serializes a list of posts, attaching each one's my_vote in a single
+ * batched lookup. Returns plain posts (no my_vote key) when there's no
+ * device id to answer for. */
+function serializePosts(rows, origin, deviceId) {
+  if (!deviceId) return rows.map((row) => serializePost(row, origin));
+  const votes = postVotesByDevice(rows.map((r) => r.id), deviceId);
+  return rows.map((row) => serializePost(row, origin, votes.get(row.id) ?? 0));
 }
 
 // CORS + no-cache for the whole API, ahead of every route below.
@@ -39,9 +54,10 @@ router.get("/feed", (req, res) => {
   const copy = i18n[lang];
   const origin = getOrigin(req);
 
+  const deviceId = getDeviceId(req);
   const latest = statements.latestUpload.get();
-  const posts = statements.newestUploads.all(4).map((row) => serializePost(row, origin));
-  const top = statements.topUploadsAllTime.all(3).map((row) => serializePost(row, origin));
+  const posts = serializePosts(statements.newestUploads.all(4), origin, deviceId);
+  const top = serializePosts(statements.topUploadsAllTime.all(3), origin, deviceId);
   const dailyRow = getDailyUpload();
 
   res.json({
@@ -51,7 +67,7 @@ router.get("/feed", (req, res) => {
       days_since_last: daysSince(latest?.created_at)
     },
     quote: (() => { const q = ai.getQuotes(lang); return q[Math.floor(Math.random() * q.length)]; })(),
-    daily: dailyRow ? serializePost(dailyRow, origin) : null,
+    daily: dailyRow ? serializePosts([dailyRow], origin, deviceId)[0] : null,
     posts,
     top
   });
@@ -78,7 +94,7 @@ router.get("/posts", (req, res) => {
 
   const rows = statement.all(perPage + 1, offset);
   const hasNext = rows.length > perPage;
-  const items = rows.slice(0, perPage).map((row) => serializePost(row, origin));
+  const items = serializePosts(rows.slice(0, perPage), origin, getDeviceId(req));
 
   res.json({ items, page, per_page: perPage, has_next: hasNext });
 });
@@ -86,7 +102,7 @@ router.get("/posts", (req, res) => {
 router.get("/posts/:id", (req, res) => {
   const post = statements.uploadByIdPublic.get(Number(req.params.id));
   if (!post) return res.status(404).json({ error: "Post not found." });
-  res.json(serializePost(post, getOrigin(req)));
+  res.json(serializePosts([post], getOrigin(req), getDeviceId(req))[0]);
 });
 
 router.get("/random-phrase", (req, res) => {
@@ -103,14 +119,24 @@ const uploadRateLimit = createRateLimiter({
   message: "Too many uploads from this address. Try again in a few minutes."
 });
 
-router.post("/posts", uploadRateLimit, upload.single("image"), (req, res) => {
+router.post("/posts", uploadRateLimit, upload.single("image"), async (req, res) => {
   const copy = i18n[getLangParam(req)];
   const title = String(req.body.title || "").trim();
   const description = String(req.body.description || "").trim();
 
   if (!title || (!description && !req.file)) {
-    if (req.file) fs.rmSync(req.file.path, { force: true });
+    storage.discardTemp(req.file);
     return res.status(400).json({ error: copy.notEnoughBody });
+  }
+
+  // Move the file into permanent storage BEFORE writing the row, so a
+  // failed upload can't leave a post pointing at an object that isn't there.
+  try {
+    await storage.commit(req.file);
+  } catch (err) {
+    storage.discardTemp(req.file);
+    console.error(`[api] upload failed: ${err.message}`);
+    return res.status(502).json({ error: "Could not store the file. Try again." });
   }
 
   const result = statements.insertUpload.run(
@@ -121,7 +147,10 @@ router.post("/posts", uploadRateLimit, upload.single("image"), (req, res) => {
     req.file ? kindForMime(req.file.mimetype) : "story"
   );
   const created = statements.uploadByIdAny.get(result.lastInsertRowid);
-  res.status(201).json(serializePost(created, getOrigin(req)));
+  // Brand new post - the uploader hasn't voted on it yet. Mirrors the
+  // comment-create response so both write paths answer the same question.
+  const deviceId = getDeviceId(req);
+  res.status(201).json(serializePost(created, getOrigin(req), deviceId ? 0 : undefined));
 });
 
 // ---------------------------------------------------------------- votes ---
@@ -150,7 +179,9 @@ router.post("/posts/:id/vote", voteRateLimit, (req, res) => {
 
   castVote(postId, deviceId, value);
   const updated = statements.uploadByIdPublic.get(postId);
-  res.json(serializePost(updated, getOrigin(req)));
+  // The device is known here by definition, so my_vote is always present -
+  // it echoes back exactly what was just stored.
+  res.json(serializePost(updated, getOrigin(req), value));
 });
 
 // --------------------------------------------------------------- report ---
@@ -196,8 +227,8 @@ const commentRateLimit = createRateLimiter({
   message: "Too many comments from this address. Give it a minute."
 });
 
-function serializeComment(row) {
-  return {
+function serializeComment(row, myVote) {
+  const comment = {
     id: row.id,
     post_id: row.post_id,
     body: row.body,
@@ -205,6 +236,9 @@ function serializeComment(row) {
     upvotes: row.upvotes || 0,
     downvotes: row.downvotes || 0
   };
+  // Same contract as posts: omitted, not zeroed, when the caller is anonymous.
+  if (myVote !== undefined) comment.my_vote = myVote;
+  return comment;
 }
 
 router.get("/posts/:id/comments", (req, res) => {
@@ -219,14 +253,24 @@ router.get("/posts/:id/comments", (req, res) => {
   let page = Number.parseInt(req.query.page, 10);
   if (!Number.isFinite(page) || page < 1) page = 1;
 
+  // Default stays oldest-first: a comment thread is a conversation, and
+  // reading order is the sane default. sort=top is opt-in for long threads.
+  const sort = req.query.sort === "top" ? "top" : "oldest";
+  const statement = sort === "top" ? statements.commentsForPostTop : statements.commentsForPost;
+
   const total = statements.countCommentsForPost.get(postId).count;
-  const rows = statements.commentsForPost.all(postId, perPage + 1, (page - 1) * perPage);
+  const rows = statement.all(postId, perPage + 1, (page - 1) * perPage);
+  const items = rows.slice(0, perPage);
+
+  const deviceId = getDeviceId(req);
+  const votes = deviceId ? commentVotesByDevice(items.map((r) => r.id), deviceId) : null;
 
   res.json({
-    items: rows.slice(0, perPage).map(serializeComment),
+    items: items.map((row) => serializeComment(row, votes ? votes.get(row.id) ?? 0 : undefined)),
     page,
     per_page: perPage,
     total,
+    sort,
     has_next: rows.length > perPage
   });
 });
@@ -247,7 +291,8 @@ router.post("/posts/:id/comments", commentRateLimit, (req, res) => {
   const deviceId = typeof rawDevice === "string" && DEVICE_ID_RE.test(rawDevice) ? rawDevice : null;
 
   const created = addComment(postId, body, deviceId);
-  res.status(201).json(serializeComment(created));
+  // Brand new comment - the author necessarily hasn't voted on it yet.
+  res.status(201).json(serializeComment(created, deviceId ? 0 : undefined));
 });
 
 router.post("/comments/:id/vote", voteRateLimit, (req, res) => {
@@ -265,7 +310,7 @@ router.post("/comments/:id/vote", voteRateLimit, (req, res) => {
     return res.status(400).json({ error: "value must be 1, -1, or 0." });
   }
 
-  res.json(serializeComment(castCommentVote(commentId, deviceId, value)));
+  res.json(serializeComment(castCommentVote(commentId, deviceId, value), value));
 });
 
 router.post("/comments/:id/report", reportRateLimit, (req, res) => {

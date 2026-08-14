@@ -30,6 +30,41 @@ If `ADMIN_PASSWORD` is not set, the local default is `sejbosejbo`.
 
 Both are ignored by git so the site can keep its local archive separate from the code.
 
+### Moving uploads to S3
+
+Uploads live on local disk by default. Everything that touches a file goes
+through `lib/storage.js`, so switching to an S3-compatible bucket is
+configuration, not a code change. Works with your own MinIO/Ceph as well as
+R2, B2, Hetzner or AWS — it uses path-style URLs and plain SigV4, with no
+AWS SDK installed.
+
+The database is untouched by this: rows store a bare filename, and the
+driver decides what URL that becomes. So the switch is reversible.
+
+Order matters — **copy the files first, then flip the driver**, otherwise
+existing posts point at objects that aren't in the bucket yet:
+
+1. Put the `S3_*` values in the Pi's `.env` (see `deploy/.env.example`),
+   but leave `STORAGE_DRIVER=local` for now.
+2. Dry-run the migration to see what would move:
+
+   ```bash
+   docker compose exec sejbosejbo sh -c 'STORAGE_DRIVER=s3 node scripts/migrate-uploads-to-s3.js --dry-run'
+   ```
+
+3. Run it for real (drop `--dry-run`). It never deletes local files, and
+   it's safe to re-run — re-uploading just overwrites identical objects.
+4. Set `STORAGE_DRIVER=s3` in `.env`, then
+   `docker compose up -d --force-recreate`.
+5. Check a post page loads its image from the bucket. Once you're happy,
+   the local `uploads/` directory can be archived and removed by hand.
+
+To roll back, set `STORAGE_DRIVER=local` and recreate — the local files are
+still there because the migration never deleted them.
+
+A half-configured bucket (driver set to `s3` but a var missing) logs an
+error and falls back to local disk rather than taking the site down.
+
 ## JSON API
 
 Everything under `/api/v1` is documented in full in

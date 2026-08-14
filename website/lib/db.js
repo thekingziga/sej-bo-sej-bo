@@ -239,6 +239,9 @@ const statements = {
 
   insertComment: db.prepare("INSERT INTO comments (post_id, body, device_id) VALUES (?, ?, ?)"),
   commentsForPost: db.prepare("SELECT * FROM comments WHERE post_id = ? AND hidden = 0 ORDER BY datetime(created_at) ASC, id ASC LIMIT ? OFFSET ?"),
+  // Best-first for long threads. id tie-break keeps pagination stable when
+  // scores are equal, same as the post-level top sort.
+  commentsForPostTop: db.prepare("SELECT * FROM comments WHERE post_id = ? AND hidden = 0 ORDER BY (upvotes - downvotes) DESC, upvotes DESC, datetime(created_at) ASC, id ASC LIMIT ? OFFSET ?"),
   countCommentsForPost: db.prepare("SELECT COUNT(*) AS count FROM comments WHERE post_id = ? AND hidden = 0"),
   recountComments: db.prepare("SELECT COUNT(*) AS count FROM comments WHERE post_id = ? AND hidden = 0"),
   updateCommentCount: db.prepare("UPDATE uploads SET comment_count = ? WHERE id = ?"),
@@ -271,6 +274,31 @@ const statements = {
   `),
   allAiContent: db.prepare("SELECT key, lang, value, updated_at FROM ai_content ORDER BY key, lang")
 };
+
+/** Looks up one device's existing votes across a set of rows, so a list
+ * response can tell each client what it already voted.
+ *
+ * Batched deliberately: a per-row lookup would mean 24 extra queries on a
+ * gallery page. The IN clause needs a placeholder per id, so the prepared
+ * statements are cached by (table, count) - page sizes repeat, so this
+ * settles into a handful of reused statements rather than re-preparing on
+ * every request. */
+const inClauseCache = new Map();
+
+function votesByDevice(table, column, ids, deviceId) {
+  if (!deviceId || !ids.length) return new Map();
+  const cacheKey = `${table}:${ids.length}`;
+  let statement = inClauseCache.get(cacheKey);
+  if (!statement) {
+    const placeholders = ids.map(() => "?").join(",");
+    statement = db.prepare(`SELECT ${column} AS row_id, value FROM ${table} WHERE device_id = ? AND ${column} IN (${placeholders})`);
+    inClauseCache.set(cacheKey, statement);
+  }
+  return new Map(statement.all(deviceId, ...ids).map((r) => [r.row_id, r.value]));
+}
+
+const postVotesByDevice = (postIds, deviceId) => votesByDevice("votes", "post_id", postIds, deviceId);
+const commentVotesByDevice = (commentIds, deviceId) => votesByDevice("comment_votes", "comment_id", commentIds, deviceId);
 
 /** Casts (or withdraws, for value === 0) a vote and refreshes the denormalized
  * upvotes/downvotes on the post in one transaction, so list endpoints never
@@ -383,4 +411,4 @@ function clearReports(postId) {
   }
 }
 
-module.exports = { db, statements, castVote, castCommentVote, fileReport, clearReports, addComment, moderateComment, rootDir, dataDir, uploadDir };
+module.exports = { db, statements, castVote, castCommentVote, fileReport, clearReports, addComment, moderateComment, postVotesByDevice, commentVotesByDevice, rootDir, dataDir, uploadDir };

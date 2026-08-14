@@ -14,6 +14,10 @@ Build the Flutter app with:
 
 - All responses are `application/json; charset=utf-8`.
 - Errors are `{"error": "human readable message"}` with the matching HTTP status.
+- Every `429` carries a **`Retry-After`** header in seconds, and the same
+  number as `retry_after_seconds` in the body. It's computed from the sliding
+  window, so it's when a slot genuinely frees up - show "try again in N
+  seconds" and schedule the retry rather than letting the user hammer it.
 - `Cache-Control: no-store` on every response under `/api/v1` - don't cache
   vote counts or feeds client-side beyond your own app state.
 - CORS is open (`Access-Control-Allow-Origin: *`) on `/api/v1` only. Native
@@ -37,7 +41,9 @@ Build the Flutter app with:
   "pinned": false,
   "created_at": "2026-07-19T00:29:00Z",
   "upvotes": 128,
-  "downvotes": 6
+  "downvotes": 6,
+  "comment_count": 3,
+  "my_vote": 1
 }
 ```
 
@@ -47,6 +53,27 @@ Build the Flutter app with:
 - Hidden posts never appear anywhere in this API.
 - `upvotes` / `downvotes` are raw counts - derive the score client-side as
   `upvotes - downvotes`; the API doesn't send a precomputed score.
+- `comment_count` counts **visible** comments only - hiding a comment in
+  admin drops the count immediately, so a card never advertises "3 comments"
+  and then opens with two.
+
+### `my_vote` - what this caller already voted
+
+`1` | `-1` | `0`, echoing back the vote stored for your `X-Device-Id`.
+
+**The field is present only when you send an `X-Device-Id` header** on the
+request, and it appears on every read that returns posts or comments - feed,
+list, detail, comment list - plus the responses to voting, uploading and
+commenting.
+
+The omission is deliberate and worth handling explicitly: absent means *"the
+server doesn't know who you are"*, which is a different answer from `0`
+(*"you haven't voted"*). Don't treat a missing field as unvoted.
+
+Send the header on reads and you can drop client-side vote bookkeeping
+entirely - the server is now the source of truth, so a reinstall, a cleared
+cache or a second device all show the user's real votes instead of a blank
+slate that lets them vote again.
 
 ## Reads
 
@@ -153,15 +180,21 @@ reports from the same device are a legitimate stronger signal, not abuse.
 Reports don't hide or remove anything automatically - they queue for a
 human (site admin) to review at `/admin?filter=reported`.
 
-### `GET /posts/:id/comments?page=1&per_page=50`
+### `GET /posts/:id/comments?page=1&per_page=50&sort=oldest`
 
 ```json
-{ "items": [ { "id": 3, "post_id": 12, "body": "...", "created_at": "2026-08-14T01:41:04Z" } ],
-  "page": 1, "per_page": 50, "total": 3, "has_next": false }
+{ "items": [ { "id": 3, "post_id": 12, "body": "...", "created_at": "2026-08-14T01:41:04Z",
+               "upvotes": 4, "downvotes": 0, "my_vote": 0 } ],
+  "page": 1, "per_page": 50, "total": 3, "sort": "oldest", "has_next": false }
 ```
 
-`per_page` clamps to 100. Oldest first (reading order). Hidden comments
-never appear.
+`per_page` clamps to 100. Hidden comments never appear.
+
+`sort`: `oldest` (default, reading order) | `top` (by `upvotes - downvotes`,
+oldest-first tie-break for stable pagination). Unknown values fall back to
+`oldest`, and the response echoes the `sort` actually applied. The default
+stays chronological on purpose - a thread is a conversation, and `top` is
+the opt-in for long ones.
 
 ### `POST /posts/:id/comments`
 

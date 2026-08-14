@@ -1,5 +1,4 @@
 const crypto = require("crypto");
-const fs = require("fs");
 const path = require("path");
 
 const express = require("express");
@@ -7,6 +6,7 @@ const compression = require("compression");
 
 const i18n = require("./lib/i18n");
 const { rootDir, uploadDir, statements, clearReports, moderateComment } = require("./lib/db");
+const storage = require("./lib/storage");
 const {
   getLang,
   getCopy,
@@ -119,7 +119,9 @@ function getStats(req) {
  * from the MIME type, so old image rows keep working untouched. */
 function renderMedia(row, { large = false } = {}, altText = "") {
   if (!row.filename) return null;
-  const src = `/uploads/${encodeURIComponent(row.filename)}`;
+  // Relative origin: the website serves pages from the same host it serves
+  // local uploads from. On the S3 driver this comes back absolute anyway.
+  const src = storage.publicUrl(row.filename, "");
   if (row.kind === "video") {
     return `<video class="${large ? "post-media" : "card-video"}" src="${src}" controls preload="metadata" playsinline></video>`;
   }
@@ -520,14 +522,28 @@ app.get("/upload", (req, res) => {
   });
 });
 
-app.post("/upload", upload.single("image"), (req, res) => {
+app.post("/upload", upload.single("image"), async (req, res) => {
   const t = getCopy(req);
   const title = String(req.body.title || "").trim();
   const description = String(req.body.description || "").trim();
 
   if (!title || (!description && !req.file)) {
-    if (req.file) fs.rmSync(req.file.path, { force: true });
+    storage.discardTemp(req.file);
     res.status(400);
+    return renderPage(req, res, {
+      title: t.uploadErrorTitle,
+      body: `<section class="plain-head"><h1>${t.notEnough}</h1><p>${t.notEnoughBody}</p><p><a href="${withLang(req, "/upload")}">${t.tryAgain}</a></p></section>`
+    });
+  }
+
+  // Store the file before the row exists, so a storage failure can't leave
+  // a post referencing a missing object.
+  try {
+    await storage.commit(req.file);
+  } catch (err) {
+    storage.discardTemp(req.file);
+    console.error(`[upload] failed: ${err.message}`);
+    res.status(502);
     return renderPage(req, res, {
       title: t.uploadErrorTitle,
       body: `<section class="plain-head"><h1>${t.notEnough}</h1><p>${t.notEnoughBody}</p><p><a href="${withLang(req, "/upload")}">${t.tryAgain}</a></p></section>`
@@ -1037,10 +1053,10 @@ app.post("/admin/upload/:id/flags", requireAdmin, (req, res) => {
   res.redirect(withLang(req, "/admin"));
 });
 
-app.post("/admin/upload/:id/delete", requireAdmin, (req, res) => {
+app.post("/admin/upload/:id/delete", requireAdmin, async (req, res) => {
   const uploadRow = statements.uploadByIdAny.get(Number(req.params.id));
   if (uploadRow?.filename) {
-    fs.rmSync(path.join(uploadDir, uploadRow.filename), { force: true });
+    await storage.remove(uploadRow.filename);
   }
   statements.deleteUpload.run(Number(req.params.id));
   res.redirect(withLang(req, "/admin"));

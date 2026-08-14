@@ -9,6 +9,10 @@ RUN npm ci --omit=dev
 COPY server.js ./
 COPY lib ./lib
 COPY public ./public
+# Maintenance scripts run with `docker compose exec` - notably the
+# uploads-to-S3 migration. Without this they aren't in the image and the
+# migration can't be run against the live data.
+COPY scripts ./scripts
 
 RUN mkdir -p /app/data /app/uploads \
   && chown -R node:node /app
