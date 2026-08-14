@@ -170,13 +170,38 @@ connection** button. That test reports which of the three independent
 things failed - unreachable host, model not pulled, or generation itself -
 instead of a single unhelpful "didn't work".
 
-### Setting it up on the Pi
+### Choosing a backend
+
+`AI_PROVIDER=ollama` runs a local Ollama daemon. `AI_PROVIDER=openai`
+talks to any OpenAI-compatible `/chat/completions` API. Both share the
+same caching, schedule, validation and fallback - only the transport
+differs, so switching is one env var.
+
+Hosted is usually the better choice for this workload: a Pi 4 takes ~60s
+per generation and the model competes with the website for RAM, while a
+hosted call answers in a second or two. Volume is tiny - 49 requests and
+roughly 0.4M tokens a month - so cost lands in cents unless you pick a
+frontier model.
+
+```text
+AI_PROVIDER=openai
+AI_BASE_URL=https://nano-gpt.com/api/v1     # no /chat/completions suffix
+AI_API_KEY=...
+AI_MODEL=...
+```
+
+Slovenian is the constraint worth optimising for. It is a low-resource
+language, and model size matters far more for it than for English -
+sub-2B models produce unusable Slovenian regardless of prompt quality,
+which is exactly what happened with qwen2.5:0.5b and llama3.2:1b here.
+Prefer a mid-size multilingual model (roughly 10B+) and verify with the
+**test connection** button plus a forced regenerate, then read the `sl`
+rows in `/admin/settings`.
+
+### Running Ollama locally instead
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
-```
-
-```bash
 ollama pull llama3.2:1b
 ```
 
@@ -187,7 +212,9 @@ Let it listen on the LAN:
 sudo systemctl edit ollama
 ```
 
-Add, then `sudo systemctl restart ollama`:
+Add this, keeping the `[Service]` header - without it systemd silently
+ignores the lines - then `sudo systemctl daemon-reload && sudo systemctl
+restart ollama`:
 
 ```text
 [Service]
@@ -195,25 +222,18 @@ Environment="OLLAMA_HOST=0.0.0.0:11434"
 Environment="OLLAMA_KEEP_ALIVE=0"
 ```
 
-`OLLAMA_KEEP_ALIVE=0` unloads the model straight after each generation, so
-it only occupies RAM for the seconds it is actually working - which matters
-on a Pi also running the website.
+`OLLAMA_KEEP_ALIVE=0` unloads the model straight after each generation so
+it only holds RAM while working - important on a box also serving the
+site. Drop it if the machine has RAM to spare; keeping the model warm is
+much faster.
 
-Then in `.env` (use the Pi's LAN IP, not `127.0.0.1` - that would be the
-container itself):
+Then point `.env` at the host's LAN IP, never `127.0.0.1`:
 
 ```text
+AI_PROVIDER=ollama
 OLLAMA_HOST=http://192.168.69.13:11434
 OLLAMA_MODEL=llama3.2:1b
 ```
-
-Model choice: `llama3.2:1b` (~1.3GB) is the default - it writes noticeably
-better copy than `qwen2.5:0.5b` (~400MB) at roughly twice the time per
-generation (~60s vs ~30s on a Pi 4). Nothing waits on it, so the extra
-time costs nothing; drop to 0.5b only if RAM is tight.
-Expect weaker Slovenian than English from any model this small - the SL
-generations are worth reading before trusting them, and clearing the
-`ai_content` rows for `sl` falls back to the curated list.
 
 ## Docker
 
@@ -253,7 +273,7 @@ Published image:
 
 ```text
 thekingziga/sejbosejbo:latest
-thekingziga/sejbosejbo:1.11.0
+thekingziga/sejbosejbo:1.12.0
 ```
 
 The published tags are `linux/arm64` only, because the image is built natively on
@@ -268,11 +288,11 @@ rsync -av --exclude node_modules --exclude data --exclude uploads --exclude .git
 Then on the Pi, build and push:
 
 ```bash
-cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.11.0 -t thekingziga/sejbosejbo:latest .
+cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.12.0 -t thekingziga/sejbosejbo:latest .
 ```
 
 ```bash
-docker login && docker push thekingziga/sejbosejbo:1.11.0 && docker push thekingziga/sejbosejbo:latest
+docker login && docker push thekingziga/sejbosejbo:1.12.0 && docker push thekingziga/sejbosejbo:latest
 ```
 
 Because the build already leaves the image on the Pi, deploying needs no pull:
@@ -288,7 +308,7 @@ or OrbStack installed locally:
 
 ```bash
 docker buildx create --use --name sejbosejbo-builder
-docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.11.0 --push .
+docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.12.0 --push .
 ```
 
 If the Pi ever runs a 32-bit OS, add `linux/arm/v7`.

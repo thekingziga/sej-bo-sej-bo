@@ -1,42 +1,98 @@
 const i18n = require("./i18n");
 const { statements } = require("./db");
 
-/** Ollama-backed copy generation.
+/** AI-backed copy generation, over either a local Ollama or any
+ * OpenAI-compatible hosted API (NanoGPT, OpenRouter, OpenAI itself...).
  *
- * Design constraint that drives everything here: this runs on a Raspberry
- * Pi 4 doing CPU-only inference. A tiny model still takes seconds to tens
- * of seconds per generation, so nothing may ever call the model during an
- * HTTP request. Instead a timer regenerates content into the ai_content
- * table and pages read the cached rows, which is a plain SQLite lookup.
+ * Design constraint that drives everything here: generation must never
+ * happen during an HTTP request. On a Pi doing CPU inference that would
+ * stall page loads for a minute; even on a fast hosted API it would put a
+ * third-party outage in the path of rendering the homepage. Instead a
+ * timer writes into the ai_content table and pages read cached rows.
  *
  * Every read falls back to the hand-written arrays in lib/i18n.js, so the
- * site is fully functional with no Ollama at all - same "unset means the
- * feature is simply off" contract as donations and SMTP.
+ * site is fully functional with no AI configured at all - the same
+ * "unset means the feature is simply off" contract as donations and SMTP.
  */
+
+// ollama = local daemon; openai = any OpenAI-compatible /chat/completions
+const AI_PROVIDER = (process.env.AI_PROVIDER || "ollama").toLowerCase();
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2:1b";
-// Generous: a Pi 4 generating ~60 tokens on a 0.5b model can genuinely
-// take a minute or two under load. Nothing is waiting on this.
-const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS || 180000);
+
+// Hosted provider. AI_BASE_URL is the root; the /chat/completions path is
+// appended, so NanoGPT is https://nano-gpt.com/api/v1
+const AI_BASE_URL = (process.env.AI_BASE_URL || "").replace(/\/$/, "");
+const AI_API_KEY = process.env.AI_API_KEY || "";
+const AI_MODEL = process.env.AI_MODEL || "";
+
+// A hosted model answers in seconds, a Pi takes a minute. One generous
+// timeout covers both; nothing is waiting on it either way.
+const AI_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS || process.env.AI_TIMEOUT_MS || 180000);
 
 const CONTENT_INTERVAL_MS = 3 * 60 * 60 * 1000; // quotes / examples / phrases
 const AWARD_INTERVAL_MS = 60 * 60 * 1000;       // checked hourly, acts once a day
 
+function usingHosted() {
+  return AI_PROVIDER === "openai";
+}
+
 function isEnabled() {
-  return Boolean(OLLAMA_HOST);
+  return usingHosted() ? Boolean(AI_BASE_URL && AI_API_KEY) : Boolean(OLLAMA_HOST);
+}
+
+function activeModel() {
+  return usingHosted() ? (AI_MODEL || "(AI_MODEL not set)") : OLLAMA_MODEL;
+}
+
+function activeHost() {
+  return usingHosted() ? (AI_BASE_URL || null) : (OLLAMA_HOST || null);
 }
 
 function describeConfig() {
-  return { enabled: isEnabled(), host: OLLAMA_HOST || null, model: OLLAMA_MODEL };
+  return {
+    enabled: isEnabled(),
+    provider: usingHosted() ? "openai-compatible" : "ollama",
+    host: activeHost(),
+    model: activeModel()
+  };
 }
 
-async function callOllama(prompt, { json = true } = {}) {
-  if (!isEnabled()) throw new Error("Ollama is not configured.");
+async function callModel(prompt, { json = true } = {}) {
+  if (!isEnabled()) throw new Error("No AI provider is configured.");
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
   try {
+    if (usingHosted()) {
+      const response = await fetch(`${AI_BASE_URL}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${AI_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: AI_MODEL,
+          messages: [{ role: "user", content: prompt }],
+          temperature: 1.0,
+          max_tokens: 400,
+          // Best-effort only. Not every gateway/model honours it, and
+          // extractJson already copes with JSON buried in prose - so a
+          // provider that ignores this still works.
+          ...(json ? { response_format: { type: "json_object" } } : {})
+        }),
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        // Truncated: provider errors can echo request bodies back.
+        throw new Error(`Provider returned ${response.status}${detail ? `: ${detail.slice(0, 160)}` : ""}`);
+      }
+      const body = await response.json();
+      return String(body.choices?.[0]?.message?.content || "");
+    }
+
     const response = await fetch(`${OLLAMA_HOST.replace(/\/$/, "")}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -193,7 +249,7 @@ const SPECS = {
 
 async function generateList(kind, lang) {
   const spec = SPECS[kind];
-  const raw = await callOllama(promptFor(kind, lang));
+  const raw = await callModel(promptFor(kind, lang));
   const parsed = extractJson(raw);
   const cleaned = cleanStringList(parsed, spec);
   if (!cleaned) throw new Error(`${kind}/${lang}: model returned unusable output`);
@@ -214,7 +270,7 @@ async function generateDailyAward() {
   const candidates = posts.slice(-40);
   const listing = candidates.map((p) => `${p.id}: ${p.title}`).join("\n");
 
-  const raw = await callOllama(`"Sejbosejbo" means something so stupid it becomes legendary.
+  const raw = await callModel(`"Sejbosejbo" means something so stupid it becomes legendary.
 Below is a numbered list of posts. Pick the ONE that is the most absurd, stupid, or funny.
 
 ${listing}
@@ -288,44 +344,55 @@ function getDailyAwardPost() {
  * rather than a single unhelpful "it didn't work". */
 async function testConnection() {
   if (!isEnabled()) {
-    return { ok: false, step: "config", message: "OLLAMA_HOST is not set." };
+    return {
+      ok: false,
+      step: "config",
+      message: usingHosted()
+        ? "AI_BASE_URL and AI_API_KEY are not both set."
+        : "OLLAMA_HOST is not set."
+    };
   }
 
-  const base = OLLAMA_HOST.replace(/\/$/, "");
   const started = Date.now();
 
-  let tags;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
-    const response = await fetch(`${base}/api/tags`, { signal: controller.signal });
-    clearTimeout(timer);
-    if (!response.ok) {
-      return { ok: false, step: "reach", message: `${base} answered ${response.status}.` };
+  // Ollama can be probed in stages (reachable / model present / generates),
+  // which gives a much more useful diagnosis. A hosted API has no
+  // equivalent cheap probe, so it goes straight to a real generation - a
+  // wrong key or model name surfaces there as an HTTP error anyway.
+  if (!usingHosted()) {
+    const base = OLLAMA_HOST.replace(/\/$/, "");
+    let tags;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      const response = await fetch(`${base}/api/tags`, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!response.ok) {
+        return { ok: false, step: "reach", message: `${base} answered ${response.status}.` };
+      }
+      tags = await response.json();
+    } catch (err) {
+      return {
+        ok: false,
+        step: "reach",
+        message: `Could not reach ${base} (${err.name === "AbortError" ? "timed out" : err.message}). ` +
+          `From inside the container 127.0.0.1 is the container itself - use the host's LAN IP.`
+      };
     }
-    tags = await response.json();
-  } catch (err) {
-    return {
-      ok: false,
-      step: "reach",
-      message: `Could not reach ${base} (${err.name === "AbortError" ? "timed out" : err.message}). ` +
-        `From inside the container 127.0.0.1 is the container itself - use the Pi's LAN IP.`
-    };
-  }
 
-  const models = (tags.models || []).map((m) => m.name);
-  // Ollama reports "qwen2.5:0.5b"; tolerate a configured name without the tag.
-  const hasModel = models.some((name) => name === OLLAMA_MODEL || name.split(":")[0] === OLLAMA_MODEL.split(":")[0]);
-  if (!hasModel) {
-    return {
-      ok: false,
-      step: "model",
-      message: `Reachable, but "${OLLAMA_MODEL}" isn't installed. Available: ${models.join(", ") || "none"}. Run: ollama pull ${OLLAMA_MODEL}`
-    };
+    const models = (tags.models || []).map((m) => m.name);
+    const hasModel = models.some((name) => name === OLLAMA_MODEL || name.split(":")[0] === OLLAMA_MODEL.split(":")[0]);
+    if (!hasModel) {
+      return {
+        ok: false,
+        step: "model",
+        message: `Reachable, but "${OLLAMA_MODEL}" isn't installed. Available: ${models.join(", ") || "none"}. Run: ollama pull ${OLLAMA_MODEL}`
+      };
+    }
   }
 
   try {
-    const raw = await callOllama(
+    const raw = await callModel(
       'Reply with only this JSON and nothing else: {"ok":true}',
       { json: true }
     );
@@ -335,20 +402,21 @@ async function testConnection() {
       return {
         ok: false,
         step: "generate",
-        message: `Model responded in ${seconds}s but the output wasn't usable JSON: ${raw.slice(0, 120)}`
+        message: `${activeModel()} responded in ${seconds}s but the output wasn't usable JSON: ${raw.slice(0, 120)}`
       };
     }
     return {
       ok: true,
       step: "generate",
-      message: `Working. ${OLLAMA_MODEL} responded in ${seconds}s.`,
-      models
+      message: `Working. ${activeModel()} responded in ${seconds}s via ${usingHosted() ? "hosted API" : "Ollama"}.`
     };
   } catch (err) {
     return {
       ok: false,
       step: "generate",
-      message: `Model is installed but generation failed: ${err.name === "AbortError" ? `timed out after ${OLLAMA_TIMEOUT_MS / 1000}s` : err.message}`
+      message: err.name === "AbortError"
+        ? `Timed out after ${AI_TIMEOUT_MS / 1000}s calling ${activeModel()}.`
+        : `Generation failed: ${err.message}`
     };
   }
 }
@@ -405,10 +473,11 @@ async function refreshAward({ force = false } = {}) {
 
 function start() {
   if (!isEnabled()) {
-    console.log("[ai] OLLAMA_HOST not set - using the built-in phrase lists.");
+    console.log("[ai] no provider configured - using the built-in phrase lists.");
     return;
   }
-  console.log(`[ai] using ${OLLAMA_HOST} (model ${OLLAMA_MODEL})`);
+  const cfg = describeConfig();
+  console.log(`[ai] using ${cfg.provider} at ${cfg.host} (model ${cfg.model})`);
 
   // Kick off shortly after boot rather than immediately, so a cold start
   // isn't competing with the app coming up.
