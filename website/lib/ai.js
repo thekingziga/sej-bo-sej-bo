@@ -15,7 +15,7 @@ const { statements } = require("./db");
  */
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5:0.5b";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2:1b";
 // Generous: a Pi 4 generating ~60 tokens on a 0.5b model can genuinely
 // take a minute or two under load. Nothing is waiting on this.
 const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS || 180000);

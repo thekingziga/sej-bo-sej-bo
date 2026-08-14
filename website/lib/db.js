@@ -113,6 +113,14 @@ if (!uploadColumns.includes("comment_count")) {
   db.exec("ALTER TABLE uploads ADD COLUMN comment_count INTEGER NOT NULL DEFAULT 0");
 }
 
+// A report now targets either a post (comment_id NULL) or one of its
+// comments. post_id stays set either way so the admin view can link to the
+// thread the comment lives in.
+const reportColumns = db.prepare("PRAGMA table_info(reports)").all().map((c) => c.name);
+if (!reportColumns.includes("comment_id")) {
+  db.exec("ALTER TABLE reports ADD COLUMN comment_id INTEGER REFERENCES comments(id) ON DELETE CASCADE");
+}
+
 const statements = {
   totalVisits: db.prepare("SELECT value FROM counters WHERE key = 'visits'"),
   incrementVisits: db.prepare("UPDATE counters SET value = value + 1 WHERE key = 'visits'"),
@@ -174,6 +182,22 @@ const statements = {
   `),
 
   insertReport: db.prepare("INSERT INTO reports (post_id, reason, details) VALUES (?, ?, ?)"),
+  insertCommentReport: db.prepare("INSERT INTO reports (post_id, comment_id, reason, details) VALUES (?, ?, ?, ?)"),
+  // Full report rows, not just a tally - the admin needs to read what the
+  // reporter actually typed, which the count alone threw away.
+  reportsForPost: db.prepare(`
+    SELECT r.*, c.body AS comment_body
+    FROM reports r LEFT JOIN comments c ON c.id = r.comment_id
+    WHERE r.post_id = ?
+    ORDER BY datetime(r.created_at) DESC, r.id DESC
+  `),
+  allReportsAdmin: db.prepare(`
+    SELECT r.*, u.title AS post_title, c.body AS comment_body
+    FROM reports r
+    JOIN uploads u ON u.id = r.post_id
+    LEFT JOIN comments c ON c.id = r.comment_id
+    ORDER BY datetime(r.created_at) DESC, r.id DESC LIMIT ?
+  `),
   incrementReportCount: db.prepare("UPDATE uploads SET report_count = report_count + 1 WHERE id = ?"),
   reportReasonTally: db.prepare("SELECT reason, COUNT(*) AS count FROM reports WHERE post_id = ? GROUP BY reason ORDER BY count DESC"),
   clearReports: db.prepare("DELETE FROM reports WHERE post_id = ?"),
@@ -237,10 +261,11 @@ function castVote(postId, deviceId, value) {
 /** Records a report and bumps the post's denormalized report_count in one
  * transaction, mirroring castVote - keeps the admin listing a plain column
  * read instead of a per-row COUNT subquery. */
-function fileReport(postId, reason, details) {
+function fileReport(postId, reason, details, commentId = null) {
   db.exec("BEGIN IMMEDIATE");
   try {
-    statements.insertReport.run(postId, reason, details || null);
+    if (commentId) statements.insertCommentReport.run(postId, commentId, reason, details || null);
+    else statements.insertReport.run(postId, reason, details || null);
     statements.incrementReportCount.run(postId);
     // Separate from report_count (which clearReports resets to 0) and from
     // the reports table itself (rows get deleted on clear) - this is the

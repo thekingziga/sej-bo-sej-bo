@@ -258,6 +258,40 @@ document.querySelectorAll("[data-report-widget]").forEach((widget) => {
   });
 })();
 
+// --- Reporting a comment -----------------------------------------------------
+
+document.querySelectorAll("[data-comment-report]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    const copy = window.SEJBOSEJBO_COPY || {};
+    const commentId = button.dataset.commentReport;
+    const reason = window.prompt(copy.commentReportPrompt || "Why are you reporting this? (spam, inappropriate, harassment, copyright, other)", "inappropriate");
+    if (reason === null) return;
+
+    const cleaned = String(reason).trim().toLowerCase();
+    if (!["spam", "inappropriate", "harassment", "copyright", "other"].includes(cleaned)) {
+      button.textContent = copy.commentReportBadReason || "unknown reason";
+      setTimeout(() => { button.textContent = copy.commentReport || "report"; }, 1800);
+      return;
+    }
+
+    button.disabled = true;
+    try {
+      const response = await fetch(`/api/v1/comments/${commentId}/report`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: cleaned })
+      });
+      if (!response.ok) throw new Error("failed");
+      button.textContent = copy.commentReported || "reported";
+      button.classList.add("done");
+    } catch {
+      button.textContent = copy.commentReportFailed || "failed";
+      button.disabled = false;
+      setTimeout(() => { button.textContent = copy.commentReport || "report"; }, 1800);
+    }
+  });
+});
+
 // --- Background music --------------------------------------------------------
 
 // Browsers refuse unmuted autoplay until the visitor has interacted with
@@ -272,8 +306,41 @@ document.querySelectorAll("[data-report-widget]").forEach((widget) => {
   if (!audio || !toggle || !icon) return;
 
   const KEY = "sejbosejbo_music";
+  // Playback position, so the track picks up where it left off instead of
+  // restarting on every page. This is a multi-page site - each navigation
+  // destroys the <audio> element, so genuinely gapless playback is not
+  // possible without turning the whole site into an SPA. Saving the
+  // position is the honest approximation: a short gap while the next page
+  // loads, then it resumes mid-track rather than from zero.
+  const POS_KEY = "sejbosejbo_music_pos";
   const VOLUME = 0.3;
   let wantsMusic = localStorage.getItem(KEY) !== "off";
+
+  function savePosition() {
+    if (audio.currentTime > 0 && Number.isFinite(audio.currentTime)) {
+      sessionStorage.setItem(POS_KEY, String(audio.currentTime));
+    }
+  }
+
+  function restorePosition() {
+    const saved = Number(sessionStorage.getItem(POS_KEY));
+    if (!Number.isFinite(saved) || saved <= 0) return;
+    const apply = () => {
+      // duration is NaN until metadata lands; guard so we never seek past
+      // the end and trigger an immediate loop back to 0.
+      if (Number.isFinite(audio.duration) && saved < audio.duration) audio.currentTime = saved;
+    };
+    if (audio.readyState >= 1) apply();
+    else audio.addEventListener("loadedmetadata", apply, { once: true });
+  }
+
+  // pagehide covers normal navigation and mobile Safari's bfcache, which
+  // "unload" does not reliably fire for.
+  window.addEventListener("pagehide", savePosition);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") savePosition();
+  });
+  setInterval(savePosition, 5000);
 
   function paint() {
     icon.textContent = wantsMusic ? "\u{1F50A}" : "\u{1F507}";
@@ -315,6 +382,7 @@ document.querySelectorAll("[data-report-widget]").forEach((widget) => {
 
   function start() {
     audio.volume = VOLUME;
+    restorePosition();
     audio.play().catch(armFirstInteraction);
   }
 

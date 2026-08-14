@@ -248,6 +248,32 @@ router.post("/posts/:id/comments", commentRateLimit, (req, res) => {
   res.status(201).json(serializeComment(created));
 });
 
+router.post("/comments/:id/report", reportRateLimit, (req, res) => {
+  const commentId = Number(req.params.id);
+  const comment = statements.commentById.get(commentId);
+  if (!comment || comment.hidden) return res.status(404).json({ error: "Comment not found." });
+
+  const reason = req.body?.reason;
+  if (!REPORT_REASONS.includes(reason)) {
+    return res.status(400).json({ error: `reason must be one of: ${REPORT_REASONS.join(", ")}.` });
+  }
+  const details = typeof req.body?.details === "string" ? req.body.details.trim().slice(0, 500) : "";
+
+  // Counted against the parent post, so a thread full of reported
+  // comments still surfaces in the admin's reported filter.
+  fileReport(comment.post_id, reason, details, commentId);
+  res.status(201).json({ ok: true });
+
+  const post = statements.uploadByIdAny.get(comment.post_id);
+  if (post) {
+    sendReportNotification({
+      post,
+      reason,
+      details: `[comment #${commentId}] ${comment.body.slice(0, 200)}${details ? ` - ${details}` : ""}`
+    }).catch(() => {});
+  }
+});
+
 // ------------------------------------------------------------ donations ---
 
 router.post("/donations/stripe/session", async (req, res, next) => {

@@ -177,7 +177,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 ```
 
 ```bash
-ollama pull qwen2.5:0.5b
+ollama pull llama3.2:1b
 ```
 
 Ollama binds to `127.0.0.1` by default, which a container cannot reach.
@@ -204,11 +204,13 @@ container itself):
 
 ```text
 OLLAMA_HOST=http://192.168.69.13:11434
-OLLAMA_MODEL=qwen2.5:0.5b
+OLLAMA_MODEL=llama3.2:1b
 ```
 
-Model choice: `qwen2.5:0.5b` (~400MB) is the safe default on a Pi 4.
-`llama3.2:1b` (~1.3GB) writes noticeably better lines if the RAM is spare.
+Model choice: `llama3.2:1b` (~1.3GB) is the default - it writes noticeably
+better copy than `qwen2.5:0.5b` (~400MB) at roughly twice the time per
+generation (~60s vs ~30s on a Pi 4). Nothing waits on it, so the extra
+time costs nothing; drop to 0.5b only if RAM is tight.
 Expect weaker Slovenian than English from any model this small - the SL
 generations are worth reading before trusting them, and clearing the
 `ai_content` rows for `sl` falls back to the curated list.
@@ -251,7 +253,7 @@ Published image:
 
 ```text
 thekingziga/sejbosejbo:latest
-thekingziga/sejbosejbo:1.9.0
+thekingziga/sejbosejbo:1.10.0
 ```
 
 The published tags are `linux/arm64` only, because the image is built natively on
@@ -266,11 +268,11 @@ rsync -av --exclude node_modules --exclude data --exclude uploads --exclude .git
 Then on the Pi, build and push:
 
 ```bash
-cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.9.0 -t thekingziga/sejbosejbo:latest .
+cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.10.0 -t thekingziga/sejbosejbo:latest .
 ```
 
 ```bash
-docker login && docker push thekingziga/sejbosejbo:1.9.0 && docker push thekingziga/sejbosejbo:latest
+docker login && docker push thekingziga/sejbosejbo:1.10.0 && docker push thekingziga/sejbosejbo:latest
 ```
 
 Because the build already leaves the image on the Pi, deploying needs no pull:
@@ -286,7 +288,7 @@ or OrbStack installed locally:
 
 ```bash
 docker buildx create --use --name sejbosejbo-builder
-docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.9.0 --push .
+docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.10.0 --push .
 ```
 
 If the Pi ever runs a 32-bit OS, add `linux/arm/v7`.

@@ -145,6 +145,7 @@ function renderCard(upload_, req) {
       <div class="vote-row" data-vote-widget data-post-id="${upload_.id}">
         <button type="button" class="vote-btn vote-up" data-vote="1" aria-label="${t.voteUp}">&#9650; <span data-vote-up>${upload_.upvotes || 0}</span></button>
         <button type="button" class="vote-btn vote-down" data-vote="-1" aria-label="${t.voteDown}">&#9660; <span data-vote-down>${upload_.downvotes || 0}</span></button>
+        <span class="comment-badge" title="${t.commentsHeading}">&#128172; ${upload_.comment_count || 0}</span>
       </div>
     </a>
   `;
@@ -235,7 +236,12 @@ function layout({ title, body, stats, req }) {
       testFailedGeneric: t.testFailedGeneric,
       commentPosted: t.commentPosted,
       commentFailed: t.commentFailed,
-      commentEmpty: t.commentEmpty
+      commentEmpty: t.commentEmpty,
+      commentReport: t.commentReport,
+      commentReported: t.commentReported,
+      commentReportFailed: t.commentReportFailed,
+      commentReportBadReason: t.commentReportBadReason,
+      commentReportPrompt: t.commentReportPrompt
     })};
   </script>
   <script src="/public/main.js"></script>
@@ -603,9 +609,12 @@ app.get("/post/:id", (req, res) => {
           ${
             comments.length
               ? comments.map((c) => `
-                  <li class="comment">
+                  <li class="comment" data-comment-id="${c.id}">
                     <p>${escapeHtml(c.body)}</p>
-                    <time>${formatDate(c.created_at)}</time>
+                    <div class="comment-meta">
+                      <time>${formatDate(c.created_at)}</time>
+                      <button type="button" class="comment-report" data-comment-report="${c.id}">${t.commentReport}</button>
+                    </div>
                   </li>
                 `).join("")
               : `<li class="comment empty" data-comment-empty>${t.commentsEmpty}</li>`
@@ -729,9 +738,9 @@ app.get("/admin", (req, res) => {
   const showReportedOnly = req.query.filter === "reported";
   const uploads = showReportedOnly ? statements.reportedUploadsAdmin.all() : statements.allUploadsAdmin.all();
   const rows = uploads.map((item) => {
-    const reasonTally = item.report_count > 0
-      ? statements.reportReasonTally.all(item.id).map((r) => `${r.reason} (${r.count})`).join(", ")
-      : "";
+    // Full rows, not just a tally - what the reporter typed is the whole
+    // point of asking for details, and the count alone discarded it.
+    const reportRows = item.report_count > 0 ? statements.reportsForPost.all(item.id) : [];
 
     return `
     <tr>
@@ -741,7 +750,22 @@ app.get("/admin", (req, res) => {
       <td>${formatDate(item.created_at)}</td>
       <td>${(item.upvotes || 0)} / ${(item.downvotes || 0)}</td>
       <td>
-        ${item.report_count > 0 ? `<strong>${item.report_count}</strong><br><span class="report-tally">${escapeHtml(reasonTally)}</span>` : "0"}
+        ${
+          item.report_count > 0
+            ? `<strong>${item.report_count}</strong>
+               <ul class="report-details">
+                 ${reportRows.map((r) => `
+                   <li>
+                     <b>${escapeHtml(r.reason)}</b>
+                     ${r.comment_id ? `<em class="report-on-comment">${t.reportOnComment}</em>` : ""}
+                     ${r.details ? `<span class="report-said">&ldquo;${escapeHtml(r.details)}&rdquo;</span>` : `<span class="report-nodetail">${t.reportNoDetails}</span>`}
+                     ${r.comment_body ? `<span class="report-quoted">${escapeHtml(r.comment_body.slice(0, 140))}</span>` : ""}
+                     <time>${formatDate(r.created_at)}</time>
+                   </li>
+                 `).join("")}
+               </ul>`
+            : "0"
+        }
         ${item.report_count > 0 ? `
           <form method="post" action="${withLang(req, `/admin/upload/${item.id}/clear-reports`)}">
             <button type="submit" class="clear-reports">${t.clearReports}</button>
