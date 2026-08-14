@@ -68,6 +68,20 @@ nav {
   flex-wrap: wrap;
 }
 
+.topbar-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.music-toggle {
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 8px;
+  background: var(--cyan);
+  box-shadow: 3px 3px 0 var(--line);
+}
+
 .language-switch {
   display: inline-flex;
   align-items: center;

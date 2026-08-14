@@ -124,6 +124,24 @@ whether SMTP is currently configured, and **send test email** delivers a
 real message to that address so you can confirm the whole chain works
 rather than waiting for a real report.
 
+## Background Music
+
+Drop a track at `public/theme.mp3` and a speaker toggle appears in the
+topbar. No file, no button - the player probes for it and stays hidden if
+it 404s, so the site ships silent until you add one.
+
+- Plays at 30% volume, looping, `preload="none"` so visitors who never
+  unmute download nothing.
+- **Browsers block unmuted autoplay.** There is no way around it. The
+  player attempts playback on load and, when the browser refuses, starts
+  on the visitor's first click/tap/keypress instead.
+- The mute choice is stored in `localStorage`, so anyone who turns it off
+  stays off on every later visit.
+
+Keep the file small - it is served off a Raspberry Pi on a home
+connection. Around 90-120 seconds at ~128 kbps (under ~2 MB) is the right
+ballpark, and it should loop cleanly with no fade.
+
 ## AI Copy (Ollama)
 
 Optional. With `OLLAMA_HOST` unset the site uses the hand-written phrase
@@ -233,7 +251,7 @@ Published image:
 
 ```text
 thekingziga/sejbosejbo:latest
-thekingziga/sejbosejbo:1.6.0
+thekingziga/sejbosejbo:1.7.0
 ```
 
 The published tags are `linux/arm64` only, because the image is built natively on
@@ -248,11 +266,11 @@ rsync -av --exclude node_modules --exclude data --exclude uploads --exclude .git
 Then on the Pi, build and push:
 
 ```bash
-cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.6.0 -t thekingziga/sejbosejbo:latest .
+cd /home/pidocker/docker_image_maker/sejbosejbo && docker build -t thekingziga/sejbosejbo:1.7.0 -t thekingziga/sejbosejbo:latest .
 ```
 
 ```bash
-docker login && docker push thekingziga/sejbosejbo:1.6.0 && docker push thekingziga/sejbosejbo:latest
+docker login && docker push thekingziga/sejbosejbo:1.7.0 && docker push thekingziga/sejbosejbo:latest
 ```
 
 Because the build already leaves the image on the Pi, deploying needs no pull:
@@ -268,7 +286,7 @@ or OrbStack installed locally:
 
 ```bash
 docker buildx create --use --name sejbosejbo-builder
-docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.6.0 --push .
+docker buildx build --platform linux/amd64,linux/arm64 -t thekingziga/sejbosejbo:latest -t thekingziga/sejbosejbo:1.7.0 --push .
 ```
 
 If the Pi ever runs a 32-bit OS, add `linux/arm/v7`.

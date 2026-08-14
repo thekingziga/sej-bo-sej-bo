@@ -158,12 +158,22 @@ function layout({ title, body, stats, req }) {
       <a href="${withLang(req, "/gallery")}">${t.navGallery}</a>
       <a href="${withLang(req, "/upload")}">${t.navUpload}</a>
     </nav>
-    <div class="language-switch" aria-label="Language switch">
-      <a class="${lang === "en" ? "active" : ""}" href="${currentPath}?lang=en">ENG</a>
-      <span>/</span>
-      <a class="${lang === "sl" ? "active" : ""}" href="${currentPath}?lang=sl">SLO</a>
+    <div class="topbar-right">
+      <button type="button" class="music-toggle" data-music-toggle hidden aria-pressed="false" title="${t.musicToggle}">
+        <span data-music-icon>&#128266;</span>
+      </button>
+      <div class="language-switch" aria-label="Language switch">
+        <a class="${lang === "en" ? "active" : ""}" href="${currentPath}?lang=en">ENG</a>
+        <span>/</span>
+        <a class="${lang === "sl" ? "active" : ""}" href="${currentPath}?lang=sl">SLO</a>
+      </div>
     </div>
   </header>
+  <!-- No autoplay attribute on purpose: browsers refuse unmuted autoplay
+       anyway, and main.js handles the "start on first interaction"
+       fallback. preload=none so visitors who never unmute pay nothing -
+       this is served off a Raspberry Pi. -->
+  <audio data-music-audio src="/public/theme.mp3" loop preload="none"></audio>
   <main>
     ${body}
     <section class="alive">

@@ -178,6 +178,69 @@ document.querySelectorAll("[data-report-widget]").forEach((widget) => {
   });
 });
 
+// --- Background music --------------------------------------------------------
+
+// Browsers refuse unmuted autoplay until the visitor has interacted with
+// the page - there is no way around that, so this tries to play, and if
+// the promise rejects it arms a one-shot listener and starts on the first
+// click/tap/key instead. The choice is remembered, so anyone who mutes
+// once stays muted on every later visit.
+(() => {
+  const audio = document.querySelector("[data-music-audio]");
+  const toggle = document.querySelector("[data-music-toggle]");
+  const icon = document.querySelector("[data-music-icon]");
+  if (!audio || !toggle || !icon) return;
+
+  const KEY = "sejbosejbo_music";
+  const VOLUME = 0.3;
+  let wantsMusic = localStorage.getItem(KEY) !== "off";
+
+  function paint() {
+    icon.textContent = wantsMusic ? "\u{1F50A}" : "\u{1F507}";
+    toggle.setAttribute("aria-pressed", String(wantsMusic));
+  }
+
+  // Only reveal the control once the file is known to exist - no point
+  // offering a mute button for a track that 404s.
+  fetch(audio.getAttribute("src"), { method: "HEAD" })
+    .then((response) => {
+      if (!response.ok) return;
+      audio.volume = VOLUME;
+      toggle.hidden = false;
+      paint();
+      if (wantsMusic) start();
+    })
+    .catch(() => {
+      /* no track shipped - stay silent and keep the button hidden */
+    });
+
+  let armed = false;
+  function armFirstInteraction() {
+    if (armed) return;
+    armed = true;
+    const kick = () => {
+      document.removeEventListener("pointerdown", kick);
+      document.removeEventListener("keydown", kick);
+      if (wantsMusic) audio.play().catch(() => {});
+    };
+    document.addEventListener("pointerdown", kick, { once: true });
+    document.addEventListener("keydown", kick, { once: true });
+  }
+
+  function start() {
+    audio.volume = VOLUME;
+    audio.play().catch(armFirstInteraction);
+  }
+
+  toggle.addEventListener("click", () => {
+    wantsMusic = !wantsMusic;
+    localStorage.setItem(KEY, wantsMusic ? "on" : "off");
+    paint();
+    if (wantsMusic) start();
+    else audio.pause();
+  });
+})();
+
 // --- Admin connection tests --------------------------------------------------
 
 // Both tests can be genuinely slow - a cold Ollama model load or an SMTP
