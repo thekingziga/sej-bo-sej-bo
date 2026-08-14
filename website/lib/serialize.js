@@ -11,7 +11,8 @@ function serializePost(row, origin) {
     pinned: !!row.pinned,
     created_at: toIsoUtc(row.created_at),
     upvotes: row.upvotes || 0,
-    downvotes: row.downvotes || 0
+    downvotes: row.downvotes || 0,
+    comment_count: row.comment_count || 0
   };
 }
 

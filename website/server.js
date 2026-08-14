@@ -3,9 +3,10 @@ const fs = require("fs");
 const path = require("path");
 
 const express = require("express");
+const compression = require("compression");
 
 const i18n = require("./lib/i18n");
-const { rootDir, uploadDir, statements, clearReports } = require("./lib/db");
+const { rootDir, uploadDir, statements, clearReports, moderateComment } = require("./lib/db");
 const {
   getLang,
   getCopy,
@@ -17,7 +18,7 @@ const {
   getDailyUpload,
   getOrigin
 } = require("./lib/util");
-const { upload } = require("./lib/upload");
+const { upload, kindForMime, isMediaEnabled, acceptAttribute } = require("./lib/upload");
 const apiRouter = require("./lib/api");
 const wellKnownRouter = require("./lib/wellKnown");
 const donations = require("./lib/donations");
@@ -43,6 +44,22 @@ const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toSt
 // Pi's port is ever exposed directly, bypassing HAProxy, that assumption
 // breaks and X-Forwarded-For becomes spoofable again.
 app.set("trust proxy", 1);
+
+// ~72% off every HTML response (10KB -> 2.8KB). Static assets are already
+// small or pre-compressed formats, so this mostly pays for the pages.
+app.use(compression());
+
+// Every page carries live state - visitor counter, random quote, daily
+// award, the Sejbometer, AI copy. Express sends an ETag but no
+// Cache-Control, which lets browsers heuristically serve a stale copy and
+// makes the site look frozen. no-cache still allows revalidation (the
+// ETag does its job), it just forbids using a cached page blind.
+app.use((req, res, next) => {
+  if (!req.path.startsWith("/public") && !req.path.startsWith("/uploads")) {
+    res.setHeader("Cache-Control", "no-cache");
+  }
+  next();
+});
 
 function parseCookies(header) {
   const cookies = {};
@@ -98,13 +115,26 @@ function getStats(req) {
   };
 }
 
+/** Renders whatever a post's file actually is. kind is set at upload time
+ * from the MIME type, so old image rows keep working untouched. */
+function renderMedia(row, { large = false } = {}, altText = "") {
+  if (!row.filename) return null;
+  const src = `/uploads/${encodeURIComponent(row.filename)}`;
+  if (row.kind === "video") {
+    return `<video class="${large ? "post-media" : "card-video"}" src="${src}" controls preload="metadata" playsinline></video>`;
+  }
+  if (row.kind === "audio") {
+    return `<div class="audio-wrap"><span class="audio-glyph" aria-hidden="true">&#127925;</span><audio src="${src}" controls preload="none"></audio></div>`;
+  }
+  return `<img class="${large ? "post-image" : ""}" src="${src}" alt="${altText}">`;
+}
+
 function renderCard(upload_, req) {
   const t = getCopy(req);
   const title = escapeHtml(upload_.title);
   const description = escapeHtml(upload_.description || "");
-  const media = upload_.filename
-    ? `<img src="/uploads/${encodeURIComponent(upload_.filename)}" alt="${title}">`
-    : `<div class="story-card">${description || t.storyFallback}</div>`;
+  const media = renderMedia(upload_, { large: false }, title)
+    || `<div class="story-card">${description || t.storyFallback}</div>`;
 
   return `
     <a class="card" href="${withLang(req, `/post/${upload_.id}`)}">
@@ -202,7 +232,10 @@ function layout({ title, body, stats, req }) {
       reportSubmitted: t.reportSubmitted,
       reportFailed: t.reportFailed,
       appComingSoonMessage: t.appComingSoonMessage,
-      testFailedGeneric: t.testFailedGeneric
+      testFailedGeneric: t.testFailedGeneric,
+      commentPosted: t.commentPosted,
+      commentFailed: t.commentFailed,
+      commentEmpty: t.commentEmpty
     })};
   </script>
   <script src="/public/main.js"></script>
@@ -231,6 +264,7 @@ function adminNav(req, active) {
   const t = getCopy(req);
   const items = [
     { key: "dashboard", href: "/admin", label: t.adminNavDashboard },
+    { key: "comments", href: "/admin/comments", label: t.adminNavComments },
     { key: "metrics", href: "/admin/metrics", label: t.adminNavMetrics },
     { key: "settings", href: "/admin/settings", label: t.adminNavSettings }
   ];
@@ -471,7 +505,7 @@ app.get("/upload", (req, res) => {
       <form class="form" method="post" action="${withLang(req, "/upload")}" enctype="multipart/form-data">
         <label>${t.titleLabel} <input name="title" maxlength="120" required placeholder="${t.titlePlaceholder}"></label>
         <label>${t.descLabel} <textarea name="description" maxlength="1200" rows="6" placeholder="${t.descPlaceholder}"></textarea></label>
-        <label>${t.fileLabel} <input name="image" type="file" accept="image/png,image/jpeg,image/gif,image/webp" data-image-input></label>
+        <label>${isMediaEnabled() ? t.fileLabelMedia : t.fileLabel} <input name="image" type="file" accept="${acceptAttribute()}" data-image-input></label>
         <p class="paste-hint">${t.pasteHint}</p>
         <div class="paste-preview" data-paste-preview hidden><img alt=""></div>
         <button type="submit">${t.submitButton}</button>
@@ -499,7 +533,7 @@ app.post("/upload", upload.single("image"), (req, res) => {
     description.slice(0, 1200),
     req.file ? req.file.filename : null,
     req.file ? req.file.originalname : null,
-    req.file ? "image" : "story"
+    req.file ? kindForMime(req.file.mimetype) : "story"
   );
   res.redirect(withLang(req, `/post/${result.lastInsertRowid}`));
 });
@@ -510,9 +544,10 @@ app.get("/post/:id", (req, res) => {
   if (!post) return res.status(404).redirect(withLang(req, "/404"));
   const title = escapeHtml(post.title);
   const description = escapeHtml(post.description || "");
-  const media = post.filename
-    ? `<img class="post-image" src="/uploads/${encodeURIComponent(post.filename)}" alt="${title}">`
-    : `<div class="post-story">${description}</div>`;
+  const media = renderMedia(post, { large: true }, title)
+    || `<div class="post-story">${description}</div>`;
+  // First page only - the rest load client-side if the thread is long.
+  const comments = statements.commentsForPost.all(post.id, 50, 0);
 
   renderPage(req, res, {
     title: post.title,
@@ -552,6 +587,31 @@ app.get("/post/:id", (req, res) => {
 
         <h2>${t.official}</h2>
       </article>
+
+      <section class="comments" data-comments data-post-id="${post.id}">
+        <h2>${t.commentsHeading} <span data-comment-count>${post.comment_count || 0}</span></h2>
+        <form class="comment-form" data-comment-form>
+          <label class="visually-hidden" for="comment-body">${t.commentPlaceholder}</label>
+          <textarea id="comment-body" name="body" maxlength="1000" rows="3" required placeholder="${t.commentPlaceholder}"></textarea>
+          <div class="comment-actions">
+            <button type="submit">${t.commentSubmit}</button>
+            <span class="comment-note">${t.commentAnonNote}</span>
+          </div>
+          <p class="comment-status" data-comment-status role="status"></p>
+        </form>
+        <ol class="comment-list" data-comment-list>
+          ${
+            comments.length
+              ? comments.map((c) => `
+                  <li class="comment">
+                    <p>${escapeHtml(c.body)}</p>
+                    <time>${formatDate(c.created_at)}</time>
+                  </li>
+                `).join("")
+              : `<li class="comment empty" data-comment-empty>${t.commentsEmpty}</li>`
+          }
+        </ol>
+      </section>
     `
   });
 });
@@ -710,7 +770,7 @@ app.get("/admin", (req, res) => {
     body: `
       <section class="plain-head">
         <h1>${t.adminDashboard}</h1>
-        <p>${t.totalUploads}: ${statements.allUploadsAdmin.all().length.toLocaleString("en-US")} | ${t.visitors}: ${getTotalVisits().toLocaleString("en-US")}</p>
+        <p>${t.totalUploads}: ${statements.countAllAdmin.get().count.toLocaleString("en-US")} | ${t.visitors}: ${getTotalVisits().toLocaleString("en-US")}</p>
       </section>
       ${adminNav(req, "dashboard")}
       <nav class="sort-switch" aria-label="Filter">
@@ -769,6 +829,54 @@ app.get("/admin/metrics", requireAdmin, (req, res) => {
       </div>
     `
   });
+});
+
+app.get("/admin/comments", requireAdmin, (req, res) => {
+  const t = getCopy(req);
+  const rows = statements.recentCommentsAdmin.all(200);
+
+  renderPage(req, res, {
+    title: t.adminNavComments,
+    body: `
+      <section class="plain-head"><h1>${t.commentsPageHeading}</h1></section>
+      ${adminNav(req, "comments")}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>ID</th><th>${t.commentsColumnPost}</th><th>${t.commentsColumnBody}</th><th>${t.date}</th><th>${t.flags}</th></tr></thead>
+          <tbody>${
+            rows.length
+              ? rows.map((c) => `
+                  <tr${c.hidden ? ' class="row-hidden"' : ""}>
+                    <td>${c.id}</td>
+                    <td><a href="${withLang(req, `/post/${c.post_id}`)}">${escapeHtml(c.post_title)}</a></td>
+                    <td class="comment-cell">${escapeHtml(c.body)}</td>
+                    <td>${formatDate(c.created_at)}</td>
+                    <td>
+                      <form method="post" action="${withLang(req, `/admin/comment/${c.id}/toggle`)}" class="inline-form">
+                        <button type="submit">${c.hidden ? t.commentUnhide : t.hide}</button>
+                      </form>
+                      <form method="post" action="${withLang(req, `/admin/comment/${c.id}/delete`)}" onsubmit="return confirm('${t.confirmDeleteComment}')">
+                        <button class="danger" type="submit">${t.deleteButton}</button>
+                      </form>
+                    </td>
+                  </tr>
+                `).join("")
+              : `<tr><td colspan="5">${t.noCommentsYet}</td></tr>`
+          }</tbody>
+        </table>
+      </div>
+    `
+  });
+});
+
+app.post("/admin/comment/:id/toggle", requireAdmin, (req, res) => {
+  moderateComment(Number(req.params.id));
+  res.redirect(withLang(req, "/admin/comments"));
+});
+
+app.post("/admin/comment/:id/delete", requireAdmin, (req, res) => {
+  moderateComment(Number(req.params.id), { remove: true });
+  res.redirect(withLang(req, "/admin/comments"));
 });
 
 app.get("/admin/settings", requireAdmin, (req, res) => {

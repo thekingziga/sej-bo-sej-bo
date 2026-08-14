@@ -178,6 +178,86 @@ document.querySelectorAll("[data-report-widget]").forEach((widget) => {
   });
 });
 
+// --- Comments ----------------------------------------------------------------
+
+(() => {
+  const root = document.querySelector("[data-comments]");
+  if (!root) return;
+  const form = root.querySelector("[data-comment-form]");
+  const list = root.querySelector("[data-comment-list]");
+  const status = root.querySelector("[data-comment-status]");
+  const counter = root.querySelector("[data-comment-count]");
+  const postId = root.dataset.postId;
+  if (!form || !list) return;
+
+  function formatWhen(iso) {
+    try {
+      return new Intl.DateTimeFormat("en", {
+        year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
+      }).format(new Date(iso));
+    } catch {
+      return "";
+    }
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const copy = window.SEJBOSEJBO_COPY || {};
+    const field = form.elements.body;
+    const body = field.value.trim();
+    status.textContent = "";
+    status.className = "comment-status";
+
+    if (!body) {
+      status.textContent = copy.commentEmpty || "Write something first.";
+      status.classList.add("bad");
+      return;
+    }
+
+    const submit = form.querySelector('button[type="submit"]');
+    submit.disabled = true;
+
+    try {
+      const response = await fetch(`/api/v1/posts/${postId}/comments`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          // Sent so a client can recognise its own comments later. The
+          // server treats it as optional - comments stay anonymous.
+          "X-Device-Id": getDeviceId()
+        },
+        body: JSON.stringify({ body })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "failed");
+
+      root.querySelector("[data-comment-empty]")?.remove();
+      const item = document.createElement("li");
+      item.className = "comment";
+      const p = document.createElement("p");
+      // textContent, never innerHTML: this is untrusted input echoed
+      // straight back into the page.
+      p.textContent = data.body;
+      const time = document.createElement("time");
+      time.textContent = formatWhen(data.created_at);
+      item.append(p, time);
+      list.append(item);
+
+      if (counter) counter.textContent = String(Number(counter.textContent || 0) + 1);
+      field.value = "";
+      status.textContent = copy.commentPosted || "Posted.";
+      status.classList.add("ok");
+    } catch (err) {
+      status.textContent = err.message && err.message !== "failed"
+        ? err.message
+        : (copy.commentFailed || "Could not post that. Try again.");
+      status.classList.add("bad");
+    } finally {
+      submit.disabled = false;
+    }
+  });
+})();
+
 // --- Background music --------------------------------------------------------
 
 // Browsers refuse unmuted autoplay until the visitor has interacted with

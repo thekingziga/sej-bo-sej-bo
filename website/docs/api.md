@@ -153,6 +153,29 @@ reports from the same device are a legitimate stronger signal, not abuse.
 Reports don't hide or remove anything automatically - they queue for a
 human (site admin) to review at `/admin?filter=reported`.
 
+### `GET /posts/:id/comments?page=1&per_page=50`
+
+```json
+{ "items": [ { "id": 3, "post_id": 12, "body": "...", "created_at": "2026-08-14T01:41:04Z" } ],
+  "page": 1, "per_page": 50, "total": 3, "has_next": false }
+```
+
+`per_page` clamps to 100. Oldest first (reading order). Hidden comments
+never appear.
+
+### `POST /posts/:id/comments`
+
+Body: `{"body": "..."}` - required, trimmed, max 1000 chars.
+
+`X-Device-Id` is **optional** here (unlike voting). Send it if you want
+the client to be able to recognise its own comments later; comments are
+anonymous either way and the server never exposes it.
+
+`201` with the created comment, `400` on empty/too long, `404` if the
+post is gone. **Rate limited: 15 comments / 10 min per IP.**
+
+The Post object also gained `comment_count`.
+
 ## Donations
 
 - **iOS / Android / macOS**: use StoreKit / Play Billing, then confirm with

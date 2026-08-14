@@ -67,11 +67,16 @@ function getDailyUpload() {
   const aiPick = require("./ai").getDailyAwardPost();
   if (aiPick) return aiPick;
 
-  const rows = statements.dailyPool.all();
-  if (!rows.length) return null;
+  // COUNT + OFFSET rather than loading every visible row into memory to
+  // pick one. This runs on every page render, so the old version read the
+  // whole archive - fine at 30 posts, quadratically annoying at 5000.
+  const total = statements.countVisible.get().count;
+  if (!total) return null;
   const stamp = new Date().toISOString().slice(0, 10);
   const hash = crypto.createHash("sha1").update(stamp).digest();
-  return rows[hash[0] % rows.length];
+  // Two bytes, so the spread doesn't collapse once the archive passes 256.
+  const index = ((hash[0] << 8) | hash[1]) % total;
+  return statements.dailyPick.get(index) || null;
 }
 
 /** Origin the app/browser should use to build absolute URLs (image_url,

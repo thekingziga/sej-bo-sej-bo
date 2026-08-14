@@ -137,26 +137,48 @@ function cleanStringList(value, { min, max, maxLength }) {
 
 const LANG_NAME = { en: "English", sl: "Slovenian" };
 
+// Few-shot, not instructions. Told abstractly to "write something absurd",
+// a 0.5b model produces surreal nonsense (a dog dressed as a clown, a
+// bridge between galaxies). Shown four concrete examples of the exact
+// register, it stays much closer to the joke: mundane, specific, and
+// plausibly something a real person actually did.
+const SHOTS = {
+  quotes: {
+    en: ["That's a certified Sejbosejbo.", "Peak human intelligence.", "This cannot be unseen.", "The vibes were tested. They failed."],
+    sl: ["To je certificiran Sejbosejbo.", "Vrh človeške inteligence.", "Tega se ne da odvideti.", "Brez misli, samo Sejbosejbo."]
+  },
+  phrases: {
+    en: ["Certified Sejbosejbo", "Brain.exe stopped working", "Maximum Sejbosejbo achieved", "Peak human intelligence"],
+    sl: ["Certificiran Sejbosejbo", "Možgani.exe so nehali delati", "Dosežen maksimalni Sejbosejbo", "Vrh človeške inteligence"]
+  },
+  examples: {
+    en: ["Someone microwaved ice.", "Someone installed Chrome to download Edge.", "Someone asked if Wi-Fi is wireless electricity.", "Someone charged the charger."],
+    sl: ["Nekdo je pogrel led v mikrovalovki.", "Nekdo je namestil Chrome, da je prenesel Edge.", "Nekdo je vprašal, ali je Wi-Fi brezžična elektrika.", "Nekdo je polnil polnilec."]
+  }
+};
+
+const ASKS = {
+  quotes: { count: 7, what: "short deadpan reaction lines, the kind you'd caption a screenshot of something idiotic", limit: 60 },
+  phrases: { count: 10, what: "short punchy labels, like achievement titles for doing something stupid", limit: 45 },
+  examples: { count: 3, what: "one-sentence examples of someone doing something mundane and stupid with everyday objects or technology", limit: 70 }
+};
+
 function promptFor(kind, lang) {
   const language = LANG_NAME[lang] || "English";
-  const flavour = `"Sejbosejbo" is a made-up word for something so stupid it becomes legendary. The tone is deadpan, absurd, internet-meme humour. Never explain the joke.`;
+  const ask = ASKS[kind];
+  const shots = (SHOTS[kind][lang] || SHOTS[kind].en).map((s) => `  ${JSON.stringify(s)}`).join(",\n");
 
-  if (kind === "quotes") {
-    return `${flavour}
-Write 7 very short reaction quotes in ${language}, the kind you'd caption a screenshot of something idiotic. Each under 60 characters.
-Respond with only a JSON array of 7 strings.`;
-  }
-  if (kind === "phrases") {
-    return `${flavour}
-Write 10 very short punchy labels in ${language}, like achievement titles for doing something stupid. Each under 45 characters.
-Respond with only a JSON array of 10 strings.`;
-  }
-  if (kind === "examples") {
-    return `${flavour}
-Write 3 one-sentence examples in ${language} of someone doing something absurdly stupid, each starting with "Someone" (or its ${language} equivalent). Mundane, specific, technology or everyday life. Each under 70 characters.
-Respond with only a JSON array of 3 strings.`;
-  }
-  throw new Error(`Unknown content kind: ${kind}`);
+  return `"Sejbosejbo" is a made-up word for something so stupid it becomes legendary.
+
+Here are real examples of the style, in ${language}:
+[
+${shots}
+]
+
+Now write ${ask.count} NEW ones in ${language}: ${ask.what}.
+Rules: match the style above exactly. Everyday and specific, never surreal or fantastical. Each under ${ask.limit} characters. No hashtags, no emoji, no explanations.
+
+Respond with only a JSON array of ${ask.count} strings.`;
 }
 
 // Minimums are deliberately below what the prompt asks for. A 0.5b model

@@ -3,14 +3,14 @@ const fs = require("fs");
 const express = require("express");
 
 const i18n = require("./i18n");
-const { statements, castVote, fileReport } = require("./db");
+const { statements, castVote, fileReport, addComment } = require("./db");
 const { sendReportNotification } = require("./mail");
 const ai = require("./ai");
-const { getOrigin, getTotalVisits, getDailyUpload, daysSince } = require("./util");
+const { getOrigin, getTotalVisits, getDailyUpload, daysSince, toIsoUtc } = require("./util");
 const { getClientIp } = require("./ip");
 const { createRateLimiter } = require("./rateLimit");
 const { serializePost } = require("./serialize");
-const { upload } = require("./upload");
+const { upload, kindForMime } = require("./upload");
 const donations = require("./donations");
 
 const router = express.Router();
@@ -118,7 +118,7 @@ router.post("/posts", uploadRateLimit, upload.single("image"), (req, res) => {
     description.slice(0, 1200),
     req.file ? req.file.filename : null,
     req.file ? req.file.originalname : null,
-    req.file ? "image" : "story"
+    req.file ? kindForMime(req.file.mimetype) : "story"
   );
   const created = statements.uploadByIdAny.get(result.lastInsertRowid);
   res.status(201).json(serializePost(created, getOrigin(req)));
@@ -185,6 +185,67 @@ router.post("/posts/:id/report", reportRateLimit, (req, res) => {
   // Fire-and-forget, after the response is already sent - a slow or
   // misconfigured mail server should never make the reporter wait.
   sendReportNotification({ post, reason, details }).catch(() => {});
+});
+
+// -------------------------------------------------------------- comments ---
+
+const commentRateLimit = createRateLimiter({
+  windowMs: 10 * 60 * 1000,
+  max: 15,
+  keyFn: (req) => getClientIp(req),
+  message: "Too many comments from this address. Give it a minute."
+});
+
+function serializeComment(row) {
+  return {
+    id: row.id,
+    post_id: row.post_id,
+    body: row.body,
+    created_at: toIsoUtc(row.created_at)
+  };
+}
+
+router.get("/posts/:id/comments", (req, res) => {
+  const postId = Number(req.params.id);
+  if (!statements.uploadByIdPublic.get(postId)) {
+    return res.status(404).json({ error: "Post not found." });
+  }
+
+  let perPage = Number.parseInt(req.query.per_page, 10);
+  if (!Number.isFinite(perPage) || perPage < 1) perPage = 50;
+  perPage = Math.min(perPage, 100);
+  let page = Number.parseInt(req.query.page, 10);
+  if (!Number.isFinite(page) || page < 1) page = 1;
+
+  const total = statements.countCommentsForPost.get(postId).count;
+  const rows = statements.commentsForPost.all(postId, perPage + 1, (page - 1) * perPage);
+
+  res.json({
+    items: rows.slice(0, perPage).map(serializeComment),
+    page,
+    per_page: perPage,
+    total,
+    has_next: rows.length > perPage
+  });
+});
+
+router.post("/posts/:id/comments", commentRateLimit, (req, res) => {
+  const postId = Number(req.params.id);
+  if (!statements.uploadByIdPublic.get(postId)) {
+    return res.status(404).json({ error: "Post not found." });
+  }
+
+  const body = typeof req.body?.body === "string" ? req.body.body.trim() : "";
+  if (!body) return res.status(400).json({ error: "Comment body is required." });
+  if (body.length > 1000) return res.status(400).json({ error: "Comment is too long (max 1000 characters)." });
+
+  // Optional: used only to let a client recognise its own comments. Not
+  // identity, not auth - comments stay anonymous either way.
+  const rawDevice = req.headers["x-device-id"];
+  const deviceId = typeof rawDevice === "string" && DEVICE_ID_RE.test(rawDevice) ? rawDevice : null;
+
+  const created = addComment(postId, body, deviceId);
+  res.status(201).json(serializeComment(created));
 });
 
 // ------------------------------------------------------------ donations ---

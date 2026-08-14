@@ -65,6 +65,17 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_reports_post ON reports(post_id);
 
+  CREATE TABLE IF NOT EXISTS comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+    body TEXT NOT NULL,
+    device_id TEXT,
+    hidden INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id, hidden, created_at);
+
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT ''
@@ -97,6 +108,9 @@ if (!uploadColumns.includes("downvotes")) {
 }
 if (!uploadColumns.includes("report_count")) {
   db.exec("ALTER TABLE uploads ADD COLUMN report_count INTEGER NOT NULL DEFAULT 0");
+}
+if (!uploadColumns.includes("comment_count")) {
+  db.exec("ALTER TABLE uploads ADD COLUMN comment_count INTEGER NOT NULL DEFAULT 0");
 }
 
 const statements = {
@@ -136,6 +150,10 @@ const statements = {
   updateFlag: db.prepare("UPDATE uploads SET hidden = ?, pinned = ?, featured = ? WHERE id = ?"),
   deleteUpload: db.prepare("DELETE FROM uploads WHERE id = ?"),
   dailyPool: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY id"),
+  // Pick one visible upload by position, so the daily award doesn't have
+  // to materialise the whole archive - see getDailyUpload in util.js.
+  dailyPick: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY id LIMIT 1 OFFSET ?"),
+  countAllAdmin: db.prepare("SELECT COUNT(*) AS count FROM uploads"),
 
   upsertVote: db.prepare(`
     INSERT INTO votes (post_id, device_id, value) VALUES (?, ?, ?)
@@ -172,6 +190,21 @@ const statements = {
     INSERT INTO settings (key, value) VALUES (?, ?)
     ON CONFLICT (key) DO UPDATE SET value = excluded.value
   `),
+
+  insertComment: db.prepare("INSERT INTO comments (post_id, body, device_id) VALUES (?, ?, ?)"),
+  commentsForPost: db.prepare("SELECT * FROM comments WHERE post_id = ? AND hidden = 0 ORDER BY datetime(created_at) ASC, id ASC LIMIT ? OFFSET ?"),
+  countCommentsForPost: db.prepare("SELECT COUNT(*) AS count FROM comments WHERE post_id = ? AND hidden = 0"),
+  recountComments: db.prepare("SELECT COUNT(*) AS count FROM comments WHERE post_id = ? AND hidden = 0"),
+  updateCommentCount: db.prepare("UPDATE uploads SET comment_count = ? WHERE id = ?"),
+  commentById: db.prepare("SELECT * FROM comments WHERE id = ?"),
+  hideComment: db.prepare("UPDATE comments SET hidden = ? WHERE id = ?"),
+  deleteComment: db.prepare("DELETE FROM comments WHERE id = ?"),
+  recentCommentsAdmin: db.prepare(`
+    SELECT c.*, u.title AS post_title
+    FROM comments c JOIN uploads u ON u.id = c.post_id
+    ORDER BY datetime(c.created_at) DESC, c.id DESC LIMIT ?
+  `),
+  totalComments: db.prepare("SELECT COUNT(*) AS count FROM comments WHERE hidden = 0"),
 
   getAiContent: db.prepare("SELECT value, updated_at FROM ai_content WHERE key = ? AND lang = ?"),
   setAiContent: db.prepare(`
@@ -221,6 +254,43 @@ function fileReport(postId, reason, details) {
   }
 }
 
+/** Adds a comment and refreshes the post's denormalized comment_count in
+ * one transaction, mirroring castVote/fileReport - keeps list endpoints a
+ * plain column read. */
+function addComment(postId, body, deviceId) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = statements.insertComment.run(postId, body, deviceId || null);
+    const { count } = statements.recountComments.get(postId);
+    statements.updateCommentCount.run(count, postId);
+    db.exec("COMMIT");
+    return statements.commentById.get(result.lastInsertRowid);
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+/** Hides or deletes a comment and recounts. Hiding is the softer option -
+ * the row stays for context, it just stops being served. */
+function moderateComment(commentId, { remove = false } = {}) {
+  const comment = statements.commentById.get(commentId);
+  if (!comment) return null;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (remove) statements.deleteComment.run(commentId);
+    else statements.hideComment.run(comment.hidden ? 0 : 1, commentId);
+    const { count } = statements.recountComments.get(comment.post_id);
+    statements.updateCommentCount.run(count, comment.post_id);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  return comment.post_id;
+}
+
 /** Dismisses all reports on a post (admin reviewed them, nothing to act on)
  * without touching the post itself - hiding/deleting is a separate, already
  * existing admin action. */
@@ -236,4 +306,4 @@ function clearReports(postId) {
   }
 }
 
-module.exports = { db, statements, castVote, fileReport, clearReports, rootDir, dataDir, uploadDir };
+module.exports = { db, statements, castVote, fileReport, clearReports, addComment, moderateComment, rootDir, dataDir, uploadDir };
