@@ -612,6 +612,10 @@ app.get("/post/:id", (req, res) => {
                   <li class="comment" data-comment-id="${c.id}">
                     <p>${escapeHtml(c.body)}</p>
                     <div class="comment-meta">
+                      <div class="vote-row comment-votes" data-comment-vote-widget data-comment-id="${c.id}">
+                        <button type="button" class="vote-btn vote-up" data-cvote="1" aria-label="${t.voteUp}">&#9650; <span data-cvote-up>${c.upvotes || 0}</span></button>
+                        <button type="button" class="vote-btn vote-down" data-cvote="-1" aria-label="${t.voteDown}">&#9660; <span data-cvote-down>${c.downvotes || 0}</span></button>
+                      </div>
                       <time>${formatDate(c.created_at)}</time>
                       <button type="button" class="comment-report" data-comment-report="${c.id}">${t.commentReport}</button>
                     </div>

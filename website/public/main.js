@@ -258,6 +258,55 @@ document.querySelectorAll("[data-report-widget]").forEach((widget) => {
   });
 })();
 
+// --- Voting on comments ------------------------------------------------------
+
+// Same contract as post voting: re-clicking the active direction withdraws,
+// the server recomputes and returns the authoritative counts.
+document.querySelectorAll("[data-comment-vote-widget]").forEach((widget) => {
+  const commentId = widget.dataset.commentId;
+  const upButton = widget.querySelector('[data-cvote="1"]');
+  const downButton = widget.querySelector('[data-cvote="-1"]');
+  const upCount = widget.querySelector("[data-cvote-up]");
+  const downCount = widget.querySelector("[data-cvote-down]");
+  let voted = null;
+  let busy = false;
+
+  async function send(button, value) {
+    if (busy) return;
+    busy = true;
+    upButton.disabled = true;
+    downButton.disabled = true;
+    const nextValue = voted === value ? 0 : value;
+
+    try {
+      const response = await fetch(`/api/v1/comments/${commentId}/vote`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Device-Id": getDeviceId() },
+        body: JSON.stringify({ value: nextValue })
+      });
+      if (!response.ok) throw new Error("vote failed");
+      const comment = await response.json();
+      voted = nextValue === 0 ? null : nextValue;
+      upButton.classList.toggle("active", voted === 1);
+      downButton.classList.toggle("active", voted === -1);
+      if (upCount) upCount.textContent = comment.upvotes;
+      if (downCount) downCount.textContent = comment.downvotes;
+    } catch {
+      const copy = window.SEJBOSEJBO_COPY || {};
+      button.classList.add("vote-error");
+      button.title = copy.voteFailed || "Vote failed. Try again.";
+      setTimeout(() => button.classList.remove("vote-error"), 1200);
+    } finally {
+      busy = false;
+      upButton.disabled = false;
+      downButton.disabled = false;
+    }
+  }
+
+  upButton?.addEventListener("click", () => send(upButton, 1));
+  downButton?.addEventListener("click", () => send(downButton, -1));
+});
+
 // --- Reporting a comment -----------------------------------------------------
 
 document.querySelectorAll("[data-comment-report]").forEach((button) => {

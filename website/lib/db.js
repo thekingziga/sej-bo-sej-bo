@@ -76,6 +76,19 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id, hidden, created_at);
 
+  -- Same shape as the post votes table: one row per (comment, device),
+  -- value 0 deletes rather than storing a zero.
+  CREATE TABLE IF NOT EXISTS comment_votes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL,
+    value INTEGER NOT NULL CHECK (value IN (-1, 1)),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (comment_id, device_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_comment_votes ON comment_votes(comment_id);
+
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT ''
@@ -111,6 +124,15 @@ if (!uploadColumns.includes("report_count")) {
 }
 if (!uploadColumns.includes("comment_count")) {
   db.exec("ALTER TABLE uploads ADD COLUMN comment_count INTEGER NOT NULL DEFAULT 0");
+}
+
+// comments predates comment voting, same backfill pattern as uploads.
+const commentColumns = db.prepare("PRAGMA table_info(comments)").all().map((c) => c.name);
+if (!commentColumns.includes("upvotes")) {
+  db.exec("ALTER TABLE comments ADD COLUMN upvotes INTEGER NOT NULL DEFAULT 0");
+}
+if (!commentColumns.includes("downvotes")) {
+  db.exec("ALTER TABLE comments ADD COLUMN downvotes INTEGER NOT NULL DEFAULT 0");
 }
 
 // A report now targets either a post (comment_id NULL) or one of its
@@ -221,6 +243,18 @@ const statements = {
   recountComments: db.prepare("SELECT COUNT(*) AS count FROM comments WHERE post_id = ? AND hidden = 0"),
   updateCommentCount: db.prepare("UPDATE uploads SET comment_count = ? WHERE id = ?"),
   commentById: db.prepare("SELECT * FROM comments WHERE id = ?"),
+  upsertCommentVote: db.prepare(`
+    INSERT INTO comment_votes (comment_id, device_id, value) VALUES (?, ?, ?)
+    ON CONFLICT (comment_id, device_id) DO UPDATE SET value = excluded.value, created_at = CURRENT_TIMESTAMP
+  `),
+  deleteCommentVote: db.prepare("DELETE FROM comment_votes WHERE comment_id = ? AND device_id = ?"),
+  recountCommentVotes: db.prepare(`
+    SELECT
+      COALESCE(SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END), 0) AS up,
+      COALESCE(SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END), 0) AS down
+    FROM comment_votes WHERE comment_id = ?
+  `),
+  updateCommentVoteCounts: db.prepare("UPDATE comments SET upvotes = ?, downvotes = ? WHERE id = ?"),
   hideComment: db.prepare("UPDATE comments SET hidden = ? WHERE id = ?"),
   deleteComment: db.prepare("DELETE FROM comments WHERE id = ?"),
   recentCommentsAdmin: db.prepare(`
@@ -279,6 +313,24 @@ function fileReport(postId, reason, details, commentId = null) {
   }
 }
 
+/** Casts or withdraws a vote on a comment and refreshes its denormalized
+ * counters in one transaction - identical contract to castVote for posts.
+ * Returns the updated comment. */
+function castCommentVote(commentId, deviceId, value) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (value === 0) statements.deleteCommentVote.run(commentId, deviceId);
+    else statements.upsertCommentVote.run(commentId, deviceId, value);
+    const { up, down } = statements.recountCommentVotes.get(commentId);
+    statements.updateCommentVoteCounts.run(up, down, commentId);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  return statements.commentById.get(commentId);
+}
+
 /** Adds a comment and refreshes the post's denormalized comment_count in
  * one transaction, mirroring castVote/fileReport - keeps list endpoints a
  * plain column read. */
@@ -331,4 +383,4 @@ function clearReports(postId) {
   }
 }
 
-module.exports = { db, statements, castVote, fileReport, clearReports, addComment, moderateComment, rootDir, dataDir, uploadDir };
+module.exports = { db, statements, castVote, castCommentVote, fileReport, clearReports, addComment, moderateComment, rootDir, dataDir, uploadDir };

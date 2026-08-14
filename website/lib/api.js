@@ -3,7 +3,7 @@ const fs = require("fs");
 const express = require("express");
 
 const i18n = require("./i18n");
-const { statements, castVote, fileReport, addComment } = require("./db");
+const { statements, castVote, castCommentVote, fileReport, addComment } = require("./db");
 const { sendReportNotification } = require("./mail");
 const ai = require("./ai");
 const { getOrigin, getTotalVisits, getDailyUpload, daysSince, toIsoUtc } = require("./util");
@@ -201,7 +201,9 @@ function serializeComment(row) {
     id: row.id,
     post_id: row.post_id,
     body: row.body,
-    created_at: toIsoUtc(row.created_at)
+    created_at: toIsoUtc(row.created_at),
+    upvotes: row.upvotes || 0,
+    downvotes: row.downvotes || 0
   };
 }
 
@@ -246,6 +248,24 @@ router.post("/posts/:id/comments", commentRateLimit, (req, res) => {
 
   const created = addComment(postId, body, deviceId);
   res.status(201).json(serializeComment(created));
+});
+
+router.post("/comments/:id/vote", voteRateLimit, (req, res) => {
+  const commentId = Number(req.params.id);
+  const comment = statements.commentById.get(commentId);
+  if (!comment || comment.hidden) return res.status(404).json({ error: "Comment not found." });
+
+  const deviceId = req.headers["x-device-id"];
+  if (typeof deviceId !== "string" || !DEVICE_ID_RE.test(deviceId)) {
+    return res.status(400).json({ error: "Missing or invalid X-Device-Id header." });
+  }
+
+  const value = req.body?.value;
+  if (value !== 1 && value !== -1 && value !== 0) {
+    return res.status(400).json({ error: "value must be 1, -1, or 0." });
+  }
+
+  res.json(serializeComment(castCommentVote(commentId, deviceId, value)));
 });
 
 router.post("/comments/:id/report", reportRateLimit, (req, res) => {

@@ -845,8 +845,20 @@ textarea {
 
 .comment-meta {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
+}
+
+.comment-votes {
+  margin-top: 0;
+  gap: 6px;
+}
+
+.comment-votes .vote-btn {
+  font-size: 12px;
+  padding: 3px 8px;
+  box-shadow: 2px 2px 0 var(--line);
 }
 
 .comment-report {

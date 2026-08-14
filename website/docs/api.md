@@ -174,7 +174,20 @@ anonymous either way and the server never exposes it.
 `201` with the created comment, `400` on empty/too long, `404` if the
 post is gone. **Rate limited: 15 comments / 10 min per IP.**
 
-The Post object also gained `comment_count`.
+### `POST /comments/:id/vote`
+
+Same contract as post voting. Header `X-Device-Id` is **required** here
+(8-128 chars, `[A-Za-z0-9_-]`), unlike posting a comment.
+
+Body: `{"value": 1}` - `1` sej bo, `-1` sej ne bo, `0` withdraw.
+
+Returns the **updated comment** with fresh `upvotes` / `downvotes`.
+One vote per `(comment, device)`; voting again updates rather than
+duplicates, and deleting a comment cascades its votes away.
+**Rate limited: 60 votes / min per IP.**
+
+Comment objects carry `upvotes` and `downvotes`; the Post object gained
+`comment_count`.
 
 ## Donations
 
