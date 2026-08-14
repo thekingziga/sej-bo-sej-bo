@@ -172,8 +172,13 @@ function layout({ title, body, stats, req }) {
   <!-- No autoplay attribute on purpose: browsers refuse unmuted autoplay
        anyway, and main.js handles the "start on first interaction"
        fallback. preload=none so visitors who never unmute pay nothing -
-       this is served off a Raspberry Pi. -->
-  <audio data-music-audio src="/public/theme.mp3" loop preload="none"></audio>
+       this is served off a Raspberry Pi.
+       AAC first at roughly half the bytes of the mp3; every current
+       browser takes it, and the mp3 stays as the universal fallback. -->
+  <audio data-music-audio loop preload="none">
+    <source src="/public/theme.m4a" type="audio/mp4">
+    <source src="/public/theme.mp3" type="audio/mpeg">
+  </audio>
   <main>
     ${body}
     <section class="alive">

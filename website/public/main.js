@@ -200,9 +200,15 @@ document.querySelectorAll("[data-report-widget]").forEach((widget) => {
     toggle.setAttribute("aria-pressed", String(wantsMusic));
   }
 
-  // Only reveal the control once the file is known to exist - no point
-  // offering a mute button for a track that 404s.
-  fetch(audio.getAttribute("src"), { method: "HEAD" })
+  // Only reveal the control once a track is known to exist - no point
+  // offering a mute button for audio that 404s. Probes the mp3 because
+  // it's the universal fallback: if that's present the element has
+  // something playable regardless of which <source> the browser picks.
+  const probeUrl = audio.querySelector('source[type="audio/mpeg"]')?.src
+    || audio.querySelector("source")?.src;
+  if (!probeUrl) return;
+
+  fetch(probeUrl, { method: "HEAD" })
     .then((response) => {
       if (!response.ok) return;
       audio.volume = VOLUME;

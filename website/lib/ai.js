@@ -104,18 +104,31 @@ function extractJson(text) {
  * length, no empties. Returns null (keep the fallback) rather than
  * publishing something malformed. */
 function cleanStringList(value, { min, max, maxLength }) {
-  const list = Array.isArray(value)
-    ? value
-    : Array.isArray(value?.items)
-      ? value.items
-      : Array.isArray(value?.lines)
-        ? value.lines
-        : null;
+  // Asked for a bare JSON array, qwen2.5:0.5b actually returns
+  // {"funny_strings": [...]} - it invents a wrapper key, and the key name
+  // changes with the prompt. So: take the array if we got one, otherwise
+  // take the first array-of-strings found among the object's values,
+  // whatever it happens to be called.
+  let list = null;
+  if (Array.isArray(value)) {
+    list = value;
+  } else if (value && typeof value === "object") {
+    list = Object.values(value).find(
+      (candidate) => Array.isArray(candidate) && candidate.some((item) => typeof item === "string")
+    ) || null;
+  }
   if (!list) return null;
 
   const cleaned = list
     .filter((item) => typeof item === "string")
-    .map((item) => item.replace(/\s+/g, " ").trim())
+    .map((item) => item
+      // The model likes appending social-media hashtags ("... #funny
+      // #badvideo") which look wrong on the page. Strip any trailing run
+      // of them, plus surrounding quotes it sometimes leaves behind.
+      .replace(/(?:\s+#[\p{L}\p{N}_]+)+\s*$/gu, "")
+      .replace(/^["'\s]+|["'\s]+$/g, "")
+      .replace(/\s+/g, " ")
+      .trim())
     .filter((item) => item.length > 0 && item.length <= maxLength);
 
   if (cleaned.length < min) return null;
@@ -146,10 +159,14 @@ Respond with only a JSON array of 3 strings.`;
   throw new Error(`Unknown content kind: ${kind}`);
 }
 
+// Minimums are deliberately below what the prompt asks for. A 0.5b model
+// routinely returns fewer items than requested (asked 3, gave 2), and
+// rejecting those would mean permanently falling back despite a working
+// model. The box renders fine with fewer lines.
 const SPECS = {
   quotes: { min: 3, max: 7, maxLength: 80 },
   phrases: { min: 4, max: 10, maxLength: 60 },
-  examples: { min: 3, max: 3, maxLength: 90 }
+  examples: { min: 2, max: 3, maxLength: 90 }
 };
 
 async function generateList(kind, lang) {
