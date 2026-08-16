@@ -1133,3 +1133,12 @@ footer {
     font-size: 15px;
   }
 }
+
+/* Build version in the footer. Deliberately quiet - it is for whoever is
+   debugging a deploy, not part of the joke. */
+.footer-version {
+  margin-top: 6px;
+  font-size: 11px;
+  opacity: 0.55;
+  letter-spacing: 0.05em;
+}

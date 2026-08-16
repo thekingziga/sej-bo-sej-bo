@@ -25,6 +25,11 @@ const donations = require("./lib/donations");
 const { getNotifyEmail, setNotifyEmail, sendTestEmail } = require("./lib/mail");
 const ai = require("./lib/ai");
 
+// Read from package.json rather than repeated in a constant here: the
+// version is already bumped there on every release, and a second copy is
+// a copy that eventually disagrees with the image it is printed on.
+const VERSION = require("./package.json").version;
+
 const { autoWrapAsync } = require("./lib/asyncRoutes");
 
 const app = autoWrapAsync(express());
@@ -234,6 +239,7 @@ function layout({ title, body, stats, req }) {
   <footer>
     ${t.official}
     <p class="footer-links"><a href="${withLang(req, "/privacy")}">${t.privacyFooterLink}</a> &middot; <a href="${withLang(req, "/terms")}">${t.termsFooterLink}</a></p>
+    <p class="footer-version">v${VERSION}</p>
   </footer>
   <script>
     window.SEJBOSEJBO_COPY = ${JSON.stringify({
@@ -1136,6 +1142,7 @@ app.get("/api/random-phrase", async (req, res) => {
 app.get("/health", async (req, res) => {
   res.json({
     ok: true,
+    version: VERSION,
     visits: await getTotalVisits(),
     uploads: (await statements.totalUploads.get()).count
   });
