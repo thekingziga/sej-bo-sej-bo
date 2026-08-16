@@ -4,14 +4,17 @@
     {
       "name": "sejbosejbo",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["start"],
+      "runtimeArgs": [
+        "start"
+      ],
       "port": 3000,
       "env": {
         "PGHOST": "127.0.0.1",
         "PGPORT": "55432",
         "PGUSER": "sejbosejbo",
         "PGPASSWORD": "test",
-        "PGDATABASE": "sejbosejbo"
+        "PGDATABASE": "sejbosejbo",
+        "STRIPE_SECRET_KEY": "rk_test_fake_for_preview"
       }
     }
   ]

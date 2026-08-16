@@ -204,6 +204,7 @@ function layout({ title, body, stats, req }) {
     <nav>
       <a href="${withLang(req, "/gallery")}">${t.navGallery}</a>
       <a href="${withLang(req, "/upload")}">${t.navUpload}</a>
+      <a href="${withLang(req, "/support")}">${t.navSupport}</a>
     </nav>
     <div class="topbar-right">
       <button type="button" class="music-toggle" data-music-toggle hidden aria-pressed="false" title="${t.musicToggle}">
@@ -256,7 +257,9 @@ function layout({ title, body, stats, req }) {
       commentEmpty: t.commentEmpty,
       commentReport: t.commentReport,
       commentReported: t.commentReported,
-      commentReportFailed: t.commentReportFailed
+      commentReportFailed: t.commentReportFailed,
+      supportRedirecting: t.supportRedirecting,
+      supportFailed: t.supportFailed
     })};
   </script>
   <script src="/public/main.js"></script>
@@ -769,6 +772,86 @@ app.get("/privacy", async (req, res) => {
 // alias just has to keep resolving - a redirect is fine, a 404 later isn't.
 app.get("/privacy.html", async (req, res) => {
   res.redirect(301, withLang(req, "/privacy"));
+});
+
+/** Tipping, browser edition.
+ *
+ * The website is the one surface where Stripe is allowed: Apple's and
+ * Google's rules about using their billing apply to the phone apps, not to
+ * a web page. The apps therefore hit /donations/apple|google/verify
+ * instead, and never see this page.
+ *
+ * The tier buttons post to the same /api/v1/donations/stripe/session
+ * endpoint the desktop apps use - amounts live on the server, so nothing
+ * here can ask Stripe for a different price. */
+app.get("/support", async (req, res) => {
+  const t = getCopy(req);
+  const enabled = donations.isStripeConfigured();
+
+  const tier = (id, label, note) => `
+    <button type="button" class="tier" data-tier="${id}" ${enabled ? "" : "disabled"}>
+      <strong>${label}</strong>
+      <span class="tier-amount">${donations.TIERS[id].amount_minor / 100} &euro;</span>
+      <small>${note}</small>
+    </button>`;
+
+  await renderPage(req, res, {
+    title: t.supportTitle,
+    body: `
+      <section class="plain-head">
+        <h1>${t.supportTitle}</h1>
+        <p>${t.supportIntro}</p>
+      </section>
+      <article class="policy support-page">
+        <p><em>${t.supportNoPerks}</em></p>
+
+        <h2>${t.supportPickAmount}</h2>
+        ${enabled ? `
+          <div class="tier-row" data-tier-row>
+            ${tier("small", t.supportSmall, t.supportSmallNote)}
+            ${tier("medium", t.supportMedium, t.supportMediumNote)}
+            ${tier("large", t.supportLarge, t.supportLargeNote)}
+          </div>
+          <p class="tier-status" data-tier-status role="status"></p>
+        ` : `<p class="tier-unavailable">${t.supportUnavailable}</p>`}
+
+        <p class="fine-print">${t.supportPaymentNote}</p>
+        <p class="fine-print">${t.supportAppsNote}</p>
+      </article>
+    `
+  });
+});
+
+// Where Stripe sends the customer back to. These are plain pages, not
+// confirmation: the actual record is written by the webhook, which is the
+// only thing Stripe signs. A visitor can reach /donate/thanks by typing it,
+// so it must never be treated as proof anything was paid.
+app.get("/donate/thanks", async (req, res) => {
+  const t = getCopy(req);
+  await renderPage(req, res, {
+    title: t.supportThanksTitle,
+    body: `
+      <section class="plain-head">
+        <h1>${t.supportThanksTitle}</h1>
+        <p>${t.supportThanksBody}</p>
+        <p><a href="${withLang(req, "/")}">${t.supportThanksBack}</a></p>
+      </section>
+    `
+  });
+});
+
+app.get("/donate/cancelled", async (req, res) => {
+  const t = getCopy(req);
+  await renderPage(req, res, {
+    title: t.supportCancelledTitle,
+    body: `
+      <section class="plain-head">
+        <h1>${t.supportCancelledTitle}</h1>
+        <p>${t.supportCancelledBody}</p>
+        <p><a href="${withLang(req, "/support")}">${t.supportCancelledBack}</a></p>
+      </section>
+    `
+  });
 });
 
 app.get("/terms", async (req, res) => {
