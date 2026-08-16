@@ -1,7 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const { DatabaseSync } = require("node:sqlite");
+const { Pool } = require("pg");
 
 const rootDir = path.join(__dirname, "..");
 const dataDir = path.join(rootDir, "data");
@@ -9,406 +9,465 @@ const uploadDir = path.join(rootDir, "uploads");
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(uploadDir, { recursive: true });
 
-const db = new DatabaseSync(path.join(dataDir, "sejbosejbo.sqlite"));
-db.exec("PRAGMA journal_mode = WAL");
-db.exec("PRAGMA foreign_keys = ON");
+/** Postgres, running on a box separate from the Pi.
+ *
+ * The whole data layer used to be node:sqlite's DatabaseSync, which is
+ * synchronous - every call site here and upstream is now async because the
+ * pg driver is. The statement wrapper below deliberately keeps the old
+ * .get()/.all()/.run() shape so callers only had to gain an `await`
+ * rather than be rewritten.
+ *
+ * Pool is capped at 10 even though the role has no connection limit: the
+ * server's max_connections is shared with the other apps on that box, and
+ * a connection leak here must not be able to starve them. */
+const POOL_MAX = Number(process.env.PGPOOL_MAX || 10);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS uploads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT,
-    filename TEXT,
-    original_name TEXT,
-    kind TEXT NOT NULL DEFAULT 'image',
-    hidden INTEGER NOT NULL DEFAULT 0,
-    pinned INTEGER NOT NULL DEFAULT 0,
-    featured INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || undefined,
+  host: process.env.PGHOST,
+  port: Number(process.env.PGPORT || 5432),
+  user: process.env.PGUSER,
+  password: process.env.PGPASSWORD,
+  database: process.env.PGDATABASE,
+  max: POOL_MAX,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 10_000
+});
 
-  CREATE TABLE IF NOT EXISTS counters (
-    key TEXT PRIMARY KEY,
-    value INTEGER NOT NULL DEFAULT 0
-  );
+// An idle client erroring (server restart, network blip) emits on the pool.
+// Without a handler this is an unhandled 'error' event and takes the
+// process down - the one failure mode that turns a brief DB hiccup into
+// an outage.
+pool.on("error", (err) => {
+  console.error(`[db] idle client error: ${err.message}`);
+});
 
-  INSERT OR IGNORE INTO counters (key, value) VALUES ('visits', 0);
+/** COUNT()/SUM() come back from Postgres as bigint, which node-postgres
+ * hands over as a *string* to avoid precision loss. Every count in this app
+ * fits in a JS number comfortably, and callers do arithmetic and
+ * comparisons on them, so each aggregate below is cast to int in SQL
+ * rather than parsed at every call site. */
 
-  CREATE TABLE IF NOT EXISTS votes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    post_id INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
-    device_id TEXT NOT NULL,
-    value INTEGER NOT NULL CHECK (value IN (-1, 1)),
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (post_id, device_id)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_votes_post ON votes(post_id);
-
-  CREATE TABLE IF NOT EXISTS donations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    tier_id TEXT,
-    amount_minor INTEGER,
-    currency TEXT DEFAULT 'EUR',
-    external_id TEXT UNIQUE,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    post_id INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
-    reason TEXT NOT NULL,
-    details TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_reports_post ON reports(post_id);
-
-  CREATE TABLE IF NOT EXISTS comments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    post_id INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
-    body TEXT NOT NULL,
-    device_id TEXT,
-    hidden INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id, hidden, created_at);
-
-  -- Same shape as the post votes table: one row per (comment, device),
-  -- value 0 deletes rather than storing a zero.
-  CREATE TABLE IF NOT EXISTS comment_votes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
-    device_id TEXT NOT NULL,
-    value INTEGER NOT NULL CHECK (value IN (-1, 1)),
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (comment_id, device_id)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_comment_votes ON comment_votes(comment_id);
-
-  CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL DEFAULT ''
-  );
-
-  -- Cache for Ollama-generated copy. Generation happens on a timer, never
-  -- during a request: a Pi 4 does CPU-only inference at a few tokens a
-  -- second, so generating inline would stall every page load. Pages read
-  -- this table (instant) and fall back to the static i18n arrays when a
-  -- row is missing.
-  CREATE TABLE IF NOT EXISTS ai_content (
-    key TEXT NOT NULL,
-    lang TEXT NOT NULL DEFAULT '',
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (key, lang)
-  );
-
-  INSERT OR IGNORE INTO counters (key, value) VALUES ('reports_filed', 0);
-`);
-
-// uploads predates the votes feature, so upvotes/downvotes are backfilled here
-// rather than in the CREATE TABLE above (which only runs for a fresh DB).
-const uploadColumns = db.prepare("PRAGMA table_info(uploads)").all().map((c) => c.name);
-if (!uploadColumns.includes("upvotes")) {
-  db.exec("ALTER TABLE uploads ADD COLUMN upvotes INTEGER NOT NULL DEFAULT 0");
-}
-if (!uploadColumns.includes("downvotes")) {
-  db.exec("ALTER TABLE uploads ADD COLUMN downvotes INTEGER NOT NULL DEFAULT 0");
-}
-if (!uploadColumns.includes("report_count")) {
-  db.exec("ALTER TABLE uploads ADD COLUMN report_count INTEGER NOT NULL DEFAULT 0");
-}
-if (!uploadColumns.includes("comment_count")) {
-  db.exec("ALTER TABLE uploads ADD COLUMN comment_count INTEGER NOT NULL DEFAULT 0");
+/** Wraps a SQL string in the get/all/run shape the old sqlite statements
+ * had, so upstream code reads the same. `run` also surfaces
+ * lastInsertRowid when the statement has a RETURNING id. */
+function stmt(text) {
+  return {
+    text,
+    async get(...params) {
+      const { rows } = await pool.query(text, params);
+      return rows[0];
+    },
+    async all(...params) {
+      const { rows } = await pool.query(text, params);
+      return rows;
+    },
+    async run(...params) {
+      const result = await pool.query(text, params);
+      return {
+        changes: result.rowCount,
+        lastInsertRowid: result.rows[0]?.id
+      };
+    }
+  };
 }
 
-// comments predates comment voting, same backfill pattern as uploads.
-const commentColumns = db.prepare("PRAGMA table_info(comments)").all().map((c) => c.name);
-if (!commentColumns.includes("upvotes")) {
-  db.exec("ALTER TABLE comments ADD COLUMN upvotes INTEGER NOT NULL DEFAULT 0");
-}
-if (!commentColumns.includes("downvotes")) {
-  db.exec("ALTER TABLE comments ADD COLUMN downvotes INTEGER NOT NULL DEFAULT 0");
+/** Runs fn inside a transaction on a dedicated client. Everything that
+ * mutates a denormalized counter goes through here. */
+async function withTx(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const out = await fn(client);
+    await client.query("COMMIT");
+    return out;
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch { /* connection already gone */ }
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
-// A report now targets either a post (comment_id NULL) or one of its
-// comments. post_id stays set either way so the admin view can link to the
-// thread the comment lives in.
-const reportColumns = db.prepare("PRAGMA table_info(reports)").all().map((c) => c.name);
-if (!reportColumns.includes("comment_id")) {
-  db.exec("ALTER TABLE reports ADD COLUMN comment_id INTEGER REFERENCES comments(id) ON DELETE CASCADE");
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS uploads (
+  id            integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  title         text NOT NULL,
+  description   text,
+  filename      text,
+  original_name text,
+  kind          text NOT NULL DEFAULT 'image',
+  hidden        boolean NOT NULL DEFAULT false,
+  pinned        boolean NOT NULL DEFAULT false,
+  featured      boolean NOT NULL DEFAULT false,
+  upvotes       integer NOT NULL DEFAULT 0,
+  downvotes     integer NOT NULL DEFAULT 0,
+  report_count  integer NOT NULL DEFAULT 0,
+  comment_count integer NOT NULL DEFAULT 0,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS counters (
+  key   text PRIMARY KEY,
+  value bigint NOT NULL DEFAULT 0
+);
+
+INSERT INTO counters (key, value) VALUES ('visits', 0) ON CONFLICT (key) DO NOTHING;
+INSERT INTO counters (key, value) VALUES ('reports_filed', 0) ON CONFLICT (key) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS votes (
+  id         integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  post_id    integer NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+  device_id  text NOT NULL,
+  value      integer NOT NULL CHECK (value IN (-1, 1)),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (post_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_votes_post ON votes(post_id);
+CREATE INDEX IF NOT EXISTS idx_votes_device ON votes(device_id);
+
+CREATE TABLE IF NOT EXISTS donations (
+  id           integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  source       text NOT NULL,
+  tier_id      text,
+  amount_minor integer,
+  currency     text DEFAULT 'EUR',
+  external_id  text UNIQUE,
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+  id         integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  post_id    integer NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+  body       text NOT NULL,
+  device_id  text,
+  hidden     boolean NOT NULL DEFAULT false,
+  upvotes    integer NOT NULL DEFAULT 0,
+  downvotes  integer NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id, hidden, created_at);
+
+CREATE TABLE IF NOT EXISTS reports (
+  id         integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  post_id    integer NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+  comment_id integer REFERENCES comments(id) ON DELETE CASCADE,
+  reason     text NOT NULL,
+  details    text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_reports_post ON reports(post_id);
+
+CREATE TABLE IF NOT EXISTS comment_votes (
+  id         integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  comment_id integer NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+  device_id  text NOT NULL,
+  value      integer NOT NULL CHECK (value IN (-1, 1)),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (comment_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_comment_votes ON comment_votes(comment_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key   text PRIMARY KEY,
+  value text NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS ai_content (
+  key        text NOT NULL,
+  lang       text NOT NULL DEFAULT '',
+  value      text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (key, lang)
+);
+`;
+
+/** Creates the schema if it isn't there. Must be awaited before the server
+ * starts listening - unlike the old synchronous sqlite setup, this can't
+ * happen as a side effect of requiring the module. */
+async function initDb() {
+  await pool.query(SCHEMA);
+  const { rows } = await pool.query("SELECT current_database() AS db, version() AS v");
+  console.log(`[db] postgres ready: ${rows[0].db} (pool max ${POOL_MAX})`);
 }
 
+// created_at is timestamptz, so plain column ordering is already correct -
+// the datetime() wrappers the sqlite version needed are gone.
+//
+// The Sejbometer counts posts from "today" in the site's own timezone, not
+// UTC. On sqlite this was UTC, which meant the meter reset at 01:00 or
+// 02:00 Slovenian time - a post made at half past midnight counted toward
+// the previous day. Timestamps are still *stored* as UTC; only the
+// day-boundary question is asked in local time.
+const SITE_TZ = process.env.SITE_TIMEZONE || "Europe/Ljubljana";
 const statements = {
-  totalVisits: db.prepare("SELECT value FROM counters WHERE key = 'visits'"),
-  incrementVisits: db.prepare("UPDATE counters SET value = value + 1 WHERE key = 'visits'"),
-  resetVisits: db.prepare("UPDATE counters SET value = 0 WHERE key = 'visits'"),
-  totalUploads: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0"),
-  latestUpload: db.prepare("SELECT id, title, created_at FROM uploads WHERE hidden = 0 ORDER BY datetime(created_at) DESC, id DESC LIMIT 1"),
-  // Pinned-first ordering - used only by the website's own gallery/home
-  // pages, which have always shown pinned posts jumping the queue.
-  newestUploads: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY pinned DESC, datetime(created_at) DESC, id DESC LIMIT ?"),
-  pagedUploads: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY pinned DESC, datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
+  // ::int on the counter reads for the same reason as the aggregates:
+  // the column is bigint, and node-postgres hands bigint back as a string.
+  // "21763" renders identically to 21763 on the page, so this stays
+  // invisible until something does arithmetic and gets "217631".
+  totalVisits: stmt("SELECT value::int AS value FROM counters WHERE key = 'visits'"),
+  incrementVisits: stmt("UPDATE counters SET value = value + 1 WHERE key = 'visits'"),
+  resetVisits: stmt("UPDATE counters SET value = 0 WHERE key = 'visits'"),
+  totalUploads: stmt("SELECT COUNT(*)::int AS count FROM uploads WHERE hidden = false"),
+  latestUpload: stmt("SELECT id, title, created_at FROM uploads WHERE hidden = false ORDER BY created_at DESC, id DESC LIMIT 1"),
+
+  newestUploads: stmt("SELECT * FROM uploads WHERE hidden = false ORDER BY pinned DESC, created_at DESC, id DESC LIMIT $1"),
+  pagedUploads: stmt("SELECT * FROM uploads WHERE hidden = false ORDER BY pinned DESC, created_at DESC, id DESC LIMIT $1 OFFSET $2"),
   // Pure date ordering, no pinned bump - this is /api/v1/posts?sort=newest.
-  // A pinned post from weeks ago outranking today's post in a tab literally
-  // labelled "newest" reads as a bug to an app user, even though it's
-  // "working as configured" - so the API and the website intentionally
-  // disagree here.
-  pagedUploadsNewestApi: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
-  pagedUploadsTop: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY (upvotes - downvotes) DESC, upvotes DESC, datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
-  pagedUploadsFeatured: db.prepare("SELECT * FROM uploads WHERE hidden = 0 AND featured = 1 ORDER BY datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
-  pagedUploadsPinned: db.prepare("SELECT * FROM uploads WHERE hidden = 0 AND pinned = 1 ORDER BY datetime(created_at) DESC, id DESC LIMIT ? OFFSET ?"),
-  // Counts backing the numbered pager - it needs a total, not just
-  // "is there one more row after this page".
-  countVisible: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0"),
-  // Uploads so far today, for the Sejbometer. created_at is stored as UTC
-  // and date('now') is UTC too, so the day rolls over at midnight UTC -
-  // which is 01:00/02:00 in Slovenia, not local midnight.
-  countUploadsToday: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0 AND date(created_at) = date('now')"),
-  countFeatured: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0 AND featured = 1"),
-  countPinned: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 0 AND pinned = 1"),
-  topUploadsAllTime: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY (upvotes - downvotes) DESC, upvotes DESC, datetime(created_at) DESC, id DESC LIMIT ?"),
-  allUploadsAdmin: db.prepare("SELECT * FROM uploads ORDER BY datetime(created_at) DESC, id DESC"),
-  reportedUploadsAdmin: db.prepare("SELECT * FROM uploads WHERE report_count > 0 ORDER BY report_count DESC, datetime(created_at) DESC, id DESC"),
-  uploadByIdPublic: db.prepare("SELECT * FROM uploads WHERE id = ? AND hidden = 0"),
-  uploadByIdAny: db.prepare("SELECT * FROM uploads WHERE id = ?"),
-  insertUpload: db.prepare("INSERT INTO uploads (title, description, filename, original_name, kind) VALUES (?, ?, ?, ?, ?)"),
-  updateFlag: db.prepare("UPDATE uploads SET hidden = ?, pinned = ?, featured = ? WHERE id = ?"),
-  deleteUpload: db.prepare("DELETE FROM uploads WHERE id = ?"),
-  dailyPool: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY id"),
-  // Pick one visible upload by position, so the daily award doesn't have
-  // to materialise the whole archive - see getDailyUpload in util.js.
-  dailyPick: db.prepare("SELECT * FROM uploads WHERE hidden = 0 ORDER BY id LIMIT 1 OFFSET ?"),
-  countAllAdmin: db.prepare("SELECT COUNT(*) AS count FROM uploads"),
+  pagedUploadsNewestApi: stmt("SELECT * FROM uploads WHERE hidden = false ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2"),
+  pagedUploadsTop: stmt("SELECT * FROM uploads WHERE hidden = false ORDER BY (upvotes - downvotes) DESC, upvotes DESC, created_at DESC, id DESC LIMIT $1 OFFSET $2"),
+  pagedUploadsFeatured: stmt("SELECT * FROM uploads WHERE hidden = false AND featured = true ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2"),
+  pagedUploadsPinned: stmt("SELECT * FROM uploads WHERE hidden = false AND pinned = true ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2"),
 
-  upsertVote: db.prepare(`
-    INSERT INTO votes (post_id, device_id, value) VALUES (?, ?, ?)
-    ON CONFLICT (post_id, device_id) DO UPDATE SET value = excluded.value, created_at = CURRENT_TIMESTAMP
-  `),
-  deleteVote: db.prepare("DELETE FROM votes WHERE post_id = ? AND device_id = ?"),
-  recountVotes: db.prepare(`
-    SELECT
-      COALESCE(SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END), 0) AS up,
-      COALESCE(SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END), 0) AS down
-    FROM votes WHERE post_id = ?
-  `),
-  updateVoteCounts: db.prepare("UPDATE uploads SET upvotes = ?, downvotes = ? WHERE id = ?"),
+  countVisible: stmt("SELECT COUNT(*)::int AS count FROM uploads WHERE hidden = false"),
+  countUploadsToday: stmt(`SELECT COUNT(*)::int AS count FROM uploads WHERE hidden = false AND (created_at AT TIME ZONE '${SITE_TZ}')::date = (now() AT TIME ZONE '${SITE_TZ}')::date`),
+  countFeatured: stmt("SELECT COUNT(*)::int AS count FROM uploads WHERE hidden = false AND featured = true"),
+  countPinned: stmt("SELECT COUNT(*)::int AS count FROM uploads WHERE hidden = false AND pinned = true"),
+  topUploadsAllTime: stmt("SELECT * FROM uploads WHERE hidden = false ORDER BY (upvotes - downvotes) DESC, upvotes DESC, created_at DESC, id DESC LIMIT $1"),
+  allUploadsAdmin: stmt("SELECT * FROM uploads ORDER BY created_at DESC, id DESC"),
+  reportedUploadsAdmin: stmt("SELECT * FROM uploads WHERE report_count > 0 ORDER BY report_count DESC, created_at DESC, id DESC"),
+  uploadByIdPublic: stmt("SELECT * FROM uploads WHERE id = $1 AND hidden = false"),
+  uploadByIdAny: stmt("SELECT * FROM uploads WHERE id = $1"),
+  insertUpload: stmt("INSERT INTO uploads (title, description, filename, original_name, kind) VALUES ($1, $2, $3, $4, $5) RETURNING id"),
+  updateFlag: stmt("UPDATE uploads SET hidden = $1, pinned = $2, featured = $3 WHERE id = $4"),
+  deleteUpload: stmt("DELETE FROM uploads WHERE id = $1"),
+  dailyPool: stmt("SELECT * FROM uploads WHERE hidden = false ORDER BY id"),
+  dailyPick: stmt("SELECT * FROM uploads WHERE hidden = false ORDER BY id LIMIT 1 OFFSET $1"),
+  countAllAdmin: stmt("SELECT COUNT(*)::int AS count FROM uploads"),
 
-  insertDonation: db.prepare(`
-    INSERT OR IGNORE INTO donations (source, tier_id, amount_minor, currency, external_id)
-    VALUES (?, ?, ?, ?, ?)
+  upsertVote: stmt(`
+    INSERT INTO votes (post_id, device_id, value) VALUES ($1, $2, $3)
+    ON CONFLICT (post_id, device_id) DO UPDATE SET value = excluded.value, created_at = now()
+  `),
+  deleteVote: stmt("DELETE FROM votes WHERE post_id = $1 AND device_id = $2"),
+  updateVoteCounts: stmt("UPDATE uploads SET upvotes = $1, downvotes = $2 WHERE id = $3"),
+
+  insertDonation: stmt(`
+    INSERT INTO donations (source, tier_id, amount_minor, currency, external_id)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (external_id) DO NOTHING
   `),
 
-  insertReport: db.prepare("INSERT INTO reports (post_id, reason, details) VALUES (?, ?, ?)"),
-  insertCommentReport: db.prepare("INSERT INTO reports (post_id, comment_id, reason, details) VALUES (?, ?, ?, ?)"),
-  // Full report rows, not just a tally - the admin needs to read what the
-  // reporter actually typed, which the count alone threw away.
-  reportsForPost: db.prepare(`
+  insertReport: stmt("INSERT INTO reports (post_id, reason, details) VALUES ($1, $2, $3)"),
+  insertCommentReport: stmt("INSERT INTO reports (post_id, comment_id, reason, details) VALUES ($1, $2, $3, $4)"),
+  reportsForPost: stmt(`
     SELECT r.*, c.body AS comment_body
     FROM reports r LEFT JOIN comments c ON c.id = r.comment_id
-    WHERE r.post_id = ?
-    ORDER BY datetime(r.created_at) DESC, r.id DESC
+    WHERE r.post_id = $1
+    ORDER BY r.created_at DESC, r.id DESC
   `),
-  allReportsAdmin: db.prepare(`
+  allReportsAdmin: stmt(`
     SELECT r.*, u.title AS post_title, c.body AS comment_body
     FROM reports r
     JOIN uploads u ON u.id = r.post_id
     LEFT JOIN comments c ON c.id = r.comment_id
-    ORDER BY datetime(r.created_at) DESC, r.id DESC LIMIT ?
+    ORDER BY r.created_at DESC, r.id DESC LIMIT $1
   `),
-  incrementReportCount: db.prepare("UPDATE uploads SET report_count = report_count + 1 WHERE id = ?"),
-  reportReasonTally: db.prepare("SELECT reason, COUNT(*) AS count FROM reports WHERE post_id = ? GROUP BY reason ORDER BY count DESC"),
-  clearReports: db.prepare("DELETE FROM reports WHERE post_id = ?"),
-  resetReportCount: db.prepare("UPDATE uploads SET report_count = 0 WHERE id = ?"),
-  incrementReportsFiled: db.prepare("UPDATE counters SET value = value + 1 WHERE key = 'reports_filed'"),
-  totalReportsFiled: db.prepare("SELECT value FROM counters WHERE key = 'reports_filed'"),
-  totalReportsOutstanding: db.prepare("SELECT COALESCE(SUM(report_count), 0) AS total FROM uploads"),
-  totalVotesCast: db.prepare("SELECT COALESCE(SUM(upvotes + downvotes), 0) AS total FROM uploads"),
-  totalUploadsAll: db.prepare("SELECT COUNT(*) AS count FROM uploads"),
-  totalUploadsHidden: db.prepare("SELECT COUNT(*) AS count FROM uploads WHERE hidden = 1"),
+  reportReasonTally: stmt("SELECT reason, COUNT(*)::int AS count FROM reports WHERE post_id = $1 GROUP BY reason ORDER BY count DESC"),
+  resetReportCount: stmt("UPDATE uploads SET report_count = 0 WHERE id = $1"),
+  totalReportsFiled: stmt("SELECT value::int AS value FROM counters WHERE key = 'reports_filed'"),
+  totalReportsOutstanding: stmt("SELECT COALESCE(SUM(report_count), 0)::int AS total FROM uploads"),
+  totalVotesCast: stmt("SELECT COALESCE(SUM(upvotes + downvotes), 0)::int AS total FROM uploads"),
+  totalUploadsAll: stmt("SELECT COUNT(*)::int AS count FROM uploads"),
+  totalUploadsHidden: stmt("SELECT COUNT(*)::int AS count FROM uploads WHERE hidden = true"),
 
-  getSetting: db.prepare("SELECT value FROM settings WHERE key = ?"),
-  setSetting: db.prepare(`
-    INSERT INTO settings (key, value) VALUES (?, ?)
+  getSetting: stmt("SELECT value FROM settings WHERE key = $1"),
+  setSetting: stmt(`
+    INSERT INTO settings (key, value) VALUES ($1, $2)
     ON CONFLICT (key) DO UPDATE SET value = excluded.value
   `),
 
-  insertComment: db.prepare("INSERT INTO comments (post_id, body, device_id) VALUES (?, ?, ?)"),
-  commentsForPost: db.prepare("SELECT * FROM comments WHERE post_id = ? AND hidden = 0 ORDER BY datetime(created_at) ASC, id ASC LIMIT ? OFFSET ?"),
-  // Best-first for long threads. id tie-break keeps pagination stable when
-  // scores are equal, same as the post-level top sort.
-  commentsForPostTop: db.prepare("SELECT * FROM comments WHERE post_id = ? AND hidden = 0 ORDER BY (upvotes - downvotes) DESC, upvotes DESC, datetime(created_at) ASC, id ASC LIMIT ? OFFSET ?"),
-  countCommentsForPost: db.prepare("SELECT COUNT(*) AS count FROM comments WHERE post_id = ? AND hidden = 0"),
-  recountComments: db.prepare("SELECT COUNT(*) AS count FROM comments WHERE post_id = ? AND hidden = 0"),
-  updateCommentCount: db.prepare("UPDATE uploads SET comment_count = ? WHERE id = ?"),
-  commentById: db.prepare("SELECT * FROM comments WHERE id = ?"),
-  upsertCommentVote: db.prepare(`
-    INSERT INTO comment_votes (comment_id, device_id, value) VALUES (?, ?, ?)
-    ON CONFLICT (comment_id, device_id) DO UPDATE SET value = excluded.value, created_at = CURRENT_TIMESTAMP
+  insertComment: stmt("INSERT INTO comments (post_id, body, device_id) VALUES ($1, $2, $3) RETURNING id"),
+  commentsForPost: stmt("SELECT * FROM comments WHERE post_id = $1 AND hidden = false ORDER BY created_at ASC, id ASC LIMIT $2 OFFSET $3"),
+  commentsForPostTop: stmt("SELECT * FROM comments WHERE post_id = $1 AND hidden = false ORDER BY (upvotes - downvotes) DESC, upvotes DESC, created_at ASC, id ASC LIMIT $2 OFFSET $3"),
+  countCommentsForPost: stmt("SELECT COUNT(*)::int AS count FROM comments WHERE post_id = $1 AND hidden = false"),
+  commentById: stmt("SELECT * FROM comments WHERE id = $1"),
+  upsertCommentVote: stmt(`
+    INSERT INTO comment_votes (comment_id, device_id, value) VALUES ($1, $2, $3)
+    ON CONFLICT (comment_id, device_id) DO UPDATE SET value = excluded.value, created_at = now()
   `),
-  deleteCommentVote: db.prepare("DELETE FROM comment_votes WHERE comment_id = ? AND device_id = ?"),
-  recountCommentVotes: db.prepare(`
-    SELECT
-      COALESCE(SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END), 0) AS up,
-      COALESCE(SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END), 0) AS down
-    FROM comment_votes WHERE comment_id = ?
-  `),
-  updateCommentVoteCounts: db.prepare("UPDATE comments SET upvotes = ?, downvotes = ? WHERE id = ?"),
-  hideComment: db.prepare("UPDATE comments SET hidden = ? WHERE id = ?"),
-  deleteComment: db.prepare("DELETE FROM comments WHERE id = ?"),
-  recentCommentsAdmin: db.prepare(`
+  deleteCommentVote: stmt("DELETE FROM comment_votes WHERE comment_id = $1 AND device_id = $2"),
+  updateCommentVoteCounts: stmt("UPDATE comments SET upvotes = $1, downvotes = $2 WHERE id = $3"),
+  hideComment: stmt("UPDATE comments SET hidden = $1 WHERE id = $2"),
+  deleteComment: stmt("DELETE FROM comments WHERE id = $1"),
+  recentCommentsAdmin: stmt(`
     SELECT c.*, u.title AS post_title
     FROM comments c JOIN uploads u ON u.id = c.post_id
-    ORDER BY datetime(c.created_at) DESC, c.id DESC LIMIT ?
+    ORDER BY c.created_at DESC, c.id DESC LIMIT $1
   `),
-  totalComments: db.prepare("SELECT COUNT(*) AS count FROM comments WHERE hidden = 0"),
+  totalComments: stmt("SELECT COUNT(*)::int AS count FROM comments WHERE hidden = false"),
 
-  getAiContent: db.prepare("SELECT value, updated_at FROM ai_content WHERE key = ? AND lang = ?"),
-  setAiContent: db.prepare(`
-    INSERT INTO ai_content (key, lang, value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT (key, lang) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+  getAiContent: stmt("SELECT value, updated_at FROM ai_content WHERE key = $1 AND lang = $2"),
+  setAiContent: stmt(`
+    INSERT INTO ai_content (key, lang, value, updated_at) VALUES ($1, $2, $3, now())
+    ON CONFLICT (key, lang) DO UPDATE SET value = excluded.value, updated_at = now()
   `),
-  allAiContent: db.prepare("SELECT key, lang, value, updated_at FROM ai_content ORDER BY key, lang")
+  allAiContent: stmt("SELECT key, lang, value, updated_at FROM ai_content ORDER BY key, lang")
 };
 
-/** Looks up one device's existing votes across a set of rows, so a list
- * response can tell each client what it already voted.
+/** One device's existing votes across a set of rows, so a list response can
+ * tell each client what it already voted. Batched: a per-row lookup would
+ * mean 24 extra round trips on a gallery page - and unlike sqlite, each of
+ * those is now a network hop. */
+async function postVotesByDevice(postIds, deviceId) {
+  if (!deviceId || !postIds.length) return new Map();
+  const { rows } = await pool.query(
+    "SELECT post_id AS row_id, value FROM votes WHERE device_id = $1 AND post_id = ANY($2::int[])",
+    [deviceId, postIds]
+  );
+  return new Map(rows.map((r) => [r.row_id, r.value]));
+}
+
+async function commentVotesByDevice(commentIds, deviceId) {
+  if (!deviceId || !commentIds.length) return new Map();
+  const { rows } = await pool.query(
+    "SELECT comment_id AS row_id, value FROM comment_votes WHERE device_id = $1 AND comment_id = ANY($2::int[])",
+    [deviceId, commentIds]
+  );
+  return new Map(rows.map((r) => [r.row_id, r.value]));
+}
+
+/** Casts (or withdraws, for value === 0) a vote and refreshes the
+ * denormalized counters on the post.
  *
- * Batched deliberately: a per-row lookup would mean 24 extra queries on a
- * gallery page. The IN clause needs a placeholder per id, so the prepared
- * statements are cached by (table, count) - page sizes repeat, so this
- * settles into a handful of reused statements rather than re-preparing on
- * every request. */
-const inClauseCache = new Map();
-
-function votesByDevice(table, column, ids, deviceId) {
-  if (!deviceId || !ids.length) return new Map();
-  const cacheKey = `${table}:${ids.length}`;
-  let statement = inClauseCache.get(cacheKey);
-  if (!statement) {
-    const placeholders = ids.map(() => "?").join(",");
-    statement = db.prepare(`SELECT ${column} AS row_id, value FROM ${table} WHERE device_id = ? AND ${column} IN (${placeholders})`);
-    inClauseCache.set(cacheKey, statement);
-  }
-  return new Map(statement.all(deviceId, ...ids).map((r) => [r.row_id, r.value]));
-}
-
-const postVotesByDevice = (postIds, deviceId) => votesByDevice("votes", "post_id", postIds, deviceId);
-const commentVotesByDevice = (commentIds, deviceId) => votesByDevice("comment_votes", "comment_id", commentIds, deviceId);
-
-/** Casts (or withdraws, for value === 0) a vote and refreshes the denormalized
- * upvotes/downvotes on the post in one transaction, so list endpoints never
- * need a per-row subquery. */
-function castVote(postId, deviceId, value) {
-  db.exec("BEGIN IMMEDIATE");
-  try {
+ * sqlite serialised this with BEGIN IMMEDIATE - one writer at a time for the
+ * whole file. Postgres is MVCC, so two concurrent votes on the same post
+ * would each read the pre-update tally and write it back, losing one. The
+ * SELECT ... FOR UPDATE takes a row lock on the post first, which serialises
+ * just that post's voters and leaves the rest of the table free. */
+async function castVote(postId, deviceId, value) {
+  await withTx(async (client) => {
+    await client.query("SELECT id FROM uploads WHERE id = $1 FOR UPDATE", [postId]);
     if (value === 0) {
-      statements.deleteVote.run(postId, deviceId);
+      await client.query("DELETE FROM votes WHERE post_id = $1 AND device_id = $2", [postId, deviceId]);
     } else {
-      statements.upsertVote.run(postId, deviceId, value);
+      await client.query(
+        `INSERT INTO votes (post_id, device_id, value) VALUES ($1, $2, $3)
+         ON CONFLICT (post_id, device_id) DO UPDATE SET value = excluded.value, created_at = now()`,
+        [postId, deviceId, value]
+      );
     }
-    const { up, down } = statements.recountVotes.get(postId);
-    statements.updateVoteCounts.run(up, down, postId);
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+    await client.query(
+      `UPDATE uploads SET
+         upvotes   = (SELECT COUNT(*) FROM votes WHERE post_id = $1 AND value = 1),
+         downvotes = (SELECT COUNT(*) FROM votes WHERE post_id = $1 AND value = -1)
+       WHERE id = $1`,
+      [postId]
+    );
+  });
 }
 
-/** Records a report and bumps the post's denormalized report_count in one
- * transaction, mirroring castVote - keeps the admin listing a plain column
- * read instead of a per-row COUNT subquery. */
-function fileReport(postId, reason, details, commentId = null) {
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    if (commentId) statements.insertCommentReport.run(postId, commentId, reason, details || null);
-    else statements.insertReport.run(postId, reason, details || null);
-    statements.incrementReportCount.run(postId);
-    // Separate from report_count (which clearReports resets to 0) and from
-    // the reports table itself (rows get deleted on clear) - this is the
-    // one number that survives admin dismissals, for "how many total,
-    // ever" in the metrics view.
-    statements.incrementReportsFiled.run();
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+/** Same contract for comments. Returns the updated comment. */
+async function castCommentVote(commentId, deviceId, value) {
+  return withTx(async (client) => {
+    await client.query("SELECT id FROM comments WHERE id = $1 FOR UPDATE", [commentId]);
+    if (value === 0) {
+      await client.query("DELETE FROM comment_votes WHERE comment_id = $1 AND device_id = $2", [commentId, deviceId]);
+    } else {
+      await client.query(
+        `INSERT INTO comment_votes (comment_id, device_id, value) VALUES ($1, $2, $3)
+         ON CONFLICT (comment_id, device_id) DO UPDATE SET value = excluded.value, created_at = now()`,
+        [commentId, deviceId, value]
+      );
+    }
+    const { rows } = await client.query(
+      `UPDATE comments SET
+         upvotes   = (SELECT COUNT(*) FROM comment_votes WHERE comment_id = $1 AND value = 1),
+         downvotes = (SELECT COUNT(*) FROM comment_votes WHERE comment_id = $1 AND value = -1)
+       WHERE id = $1 RETURNING *`,
+      [commentId]
+    );
+    return rows[0];
+  });
 }
 
-/** Casts or withdraws a vote on a comment and refreshes its denormalized
- * counters in one transaction - identical contract to castVote for posts.
- * Returns the updated comment. */
-function castCommentVote(commentId, deviceId, value) {
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    if (value === 0) statements.deleteCommentVote.run(commentId, deviceId);
-    else statements.upsertCommentVote.run(commentId, deviceId, value);
-    const { up, down } = statements.recountCommentVotes.get(commentId);
-    statements.updateCommentVoteCounts.run(up, down, commentId);
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
-  return statements.commentById.get(commentId);
+/** Records a report and bumps the post's denormalized report_count. */
+async function fileReport(postId, reason, details, commentId = null) {
+  await withTx(async (client) => {
+    if (commentId) {
+      await client.query(
+        "INSERT INTO reports (post_id, comment_id, reason, details) VALUES ($1, $2, $3, $4)",
+        [postId, commentId, reason, details || null]
+      );
+    } else {
+      await client.query(
+        "INSERT INTO reports (post_id, reason, details) VALUES ($1, $2, $3)",
+        [postId, reason, details || null]
+      );
+    }
+    // Recount rather than increment: an increment on top of a stale read
+    // double-counts under concurrency, and reports are cheap to count.
+    await client.query(
+      "UPDATE uploads SET report_count = (SELECT COUNT(*) FROM reports WHERE post_id = $1) WHERE id = $1",
+      [postId]
+    );
+    // Survives admin dismissals - "how many were ever filed", for metrics.
+    await client.query("UPDATE counters SET value = value + 1 WHERE key = 'reports_filed'");
+  });
 }
 
-/** Adds a comment and refreshes the post's denormalized comment_count in
- * one transaction, mirroring castVote/fileReport - keeps list endpoints a
- * plain column read. */
-function addComment(postId, body, deviceId) {
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const result = statements.insertComment.run(postId, body, deviceId || null);
-    const { count } = statements.recountComments.get(postId);
-    statements.updateCommentCount.run(count, postId);
-    db.exec("COMMIT");
-    return statements.commentById.get(result.lastInsertRowid);
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+/** Adds a comment and refreshes the post's denormalized comment_count. */
+async function addComment(postId, body, deviceId) {
+  return withTx(async (client) => {
+    const { rows } = await client.query(
+      "INSERT INTO comments (post_id, body, device_id) VALUES ($1, $2, $3) RETURNING *",
+      [postId, body, deviceId || null]
+    );
+    await client.query(
+      "UPDATE uploads SET comment_count = (SELECT COUNT(*) FROM comments WHERE post_id = $1 AND hidden = false) WHERE id = $1",
+      [postId]
+    );
+    return rows[0];
+  });
 }
 
 /** Hides or deletes a comment and recounts. Hiding is the softer option -
  * the row stays for context, it just stops being served. */
-function moderateComment(commentId, { remove = false } = {}) {
-  const comment = statements.commentById.get(commentId);
-  if (!comment) return null;
+async function moderateComment(commentId, { remove = false } = {}) {
+  return withTx(async (client) => {
+    const { rows } = await client.query("SELECT * FROM comments WHERE id = $1 FOR UPDATE", [commentId]);
+    const comment = rows[0];
+    if (!comment) return null;
 
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    if (remove) statements.deleteComment.run(commentId);
-    else statements.hideComment.run(comment.hidden ? 0 : 1, commentId);
-    const { count } = statements.recountComments.get(comment.post_id);
-    statements.updateCommentCount.run(count, comment.post_id);
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
-  return comment.post_id;
+    if (remove) {
+      await client.query("DELETE FROM comments WHERE id = $1", [commentId]);
+    } else {
+      await client.query("UPDATE comments SET hidden = NOT hidden WHERE id = $1", [commentId]);
+    }
+    await client.query(
+      "UPDATE uploads SET comment_count = (SELECT COUNT(*) FROM comments WHERE post_id = $1 AND hidden = false) WHERE id = $1",
+      [comment.post_id]
+    );
+    return comment.post_id;
+  });
 }
 
-/** Dismisses all reports on a post (admin reviewed them, nothing to act on)
- * without touching the post itself - hiding/deleting is a separate, already
- * existing admin action. */
-function clearReports(postId) {
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    statements.clearReports.run(postId);
-    statements.resetReportCount.run(postId);
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+/** Dismisses all reports on a post without touching the post itself. */
+async function clearReports(postId) {
+  await withTx(async (client) => {
+    await client.query("DELETE FROM reports WHERE post_id = $1", [postId]);
+    await client.query("UPDATE uploads SET report_count = 0 WHERE id = $1", [postId]);
+  });
 }
 
-module.exports = { db, statements, castVote, castCommentVote, fileReport, clearReports, addComment, moderateComment, postVotesByDevice, commentVotesByDevice, rootDir, dataDir, uploadDir };
+async function closeDb() {
+  await pool.end();
+}
+
+module.exports = {
+  pool,
+  initDb,
+  closeDb,
+  statements,
+  castVote,
+  castCommentVote,
+  fileReport,
+  clearReports,
+  addComment,
+  moderateComment,
+  postVotesByDevice,
+  commentVotesByDevice,
+  rootDir,
+  dataDir,
+  uploadDir
+};

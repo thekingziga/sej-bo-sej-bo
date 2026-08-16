@@ -5,7 +5,7 @@ const express = require("express");
 const compression = require("compression");
 
 const i18n = require("./lib/i18n");
-const { rootDir, uploadDir, statements, clearReports, moderateComment } = require("./lib/db");
+const { rootDir, uploadDir, statements, clearReports, moderateComment, initDb } = require("./lib/db");
 const storage = require("./lib/storage");
 const {
   getLang,
@@ -25,7 +25,9 @@ const donations = require("./lib/donations");
 const { getNotifyEmail, setNotifyEmail, sendTestEmail } = require("./lib/mail");
 const ai = require("./lib/ai");
 
-const app = express();
+const { autoWrapAsync } = require("./lib/asyncRoutes");
+
+const app = autoWrapAsync(express());
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "sejbosejbo";
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex");
@@ -102,13 +104,19 @@ function setSessionCookie(res, sessionData) {
   res.setHeader("Set-Cookie", `sejbosejbo_session=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
 }
 
-function getStats(req) {
+async function getStats(req) {
   const t = getCopy(req);
-  const latest = statements.latestUpload.get();
-  const daily = getDailyUpload();
+  // Independent reads - issue them together rather than paying a serial
+  // network round trip for each, now that the database is off-box.
+  const [latest, daily, visits, uploads] = await Promise.all([
+    statements.latestUpload.get(),
+    getDailyUpload(),
+    getTotalVisits(),
+    statements.totalUploads.get()
+  ]);
   return {
-    visits: getTotalVisits(),
-    uploads: statements.totalUploads.get().count,
+    visits,
+    uploads: uploads.count,
     latest,
     daily,
     quote: (() => { const q = ai.getQuotes(getLang(req)); return q[Math.floor(Math.random() * q.length)]; })()
@@ -249,8 +257,8 @@ function layout({ title, body, stats, req }) {
 </html>`;
 }
 
-function renderPage(req, res, options) {
-  res.send(layout({ ...options, req, stats: getStats(req) }));
+async function renderPage(req, res, options) {
+  res.send(layout({ ...options, req, stats: await getStats(req) }));
 }
 
 function requireAdmin(req, res, next) {
@@ -320,7 +328,12 @@ app.use((req, res, next) => {
   // its own callers (the app) and must not inflate it.
   if (req.path.startsWith("/api/v1")) return next();
   if (!req.session.countedVisit) {
-    statements.incrementVisits.run();
+    // Deliberately not awaited: this is a novelty counter, and making every
+    // first page view wait on a write to a database on another machine is a
+    // worse trade than occasionally missing a count. The .catch() is
+    // required - an unhandled rejection here would take the process down.
+    statements.incrementVisits.run()
+      .catch((err) => console.error(`[visits] increment failed: ${err.message}`));
     req.session.countedVisit = true;
   }
   next();
@@ -328,9 +341,9 @@ app.use((req, res, next) => {
 
 app.use("/api/v1", apiRouter);
 
-app.get("/", (req, res) => {
+app.get("/", async (req, res) => {
   const t = getCopy(req);
-  const newest = statements.newestUploads.all(8);
+  const newest = await statements.newestUploads.all(8);
   const cards = newest.length ? newest.map((item) => renderCard(item, req)).join("") : `<p class="empty">${t.emptyHome}</p>`;
   const examples = ai.getExamples(getLang(req));
 
@@ -338,11 +351,14 @@ app.get("/", (req, res) => {
   // count would sit pegged at MAX forever once the archive got past six
   // and stop meaning anything. This way it empties overnight and fills as
   // the day's uploads come in.
-  const uploadCount = statements.countUploadsToday.get().count;
+  const [uploadCount, visitorTotal] = await Promise.all([
+    statements.countUploadsToday.get().then((r) => r.count),
+    getTotalVisits()
+  ]);
   const meterPercent = Math.min(Math.round((uploadCount / METER_TARGET) * 100), 100);
   const meterMaxed = uploadCount >= METER_TARGET;
 
-  renderPage(req, res, {
+  await renderPage(req, res, {
     title: t.homeTitle,
     body: `
       <section class="hero">
@@ -355,7 +371,7 @@ app.get("/", (req, res) => {
         <p><b>${escapeHtml(examples[examples.length - 1])}</b></p>
       </section>
 
-      <section class="counter-box">${t.visitorLine} #${getTotalVisits().toLocaleString("en-US")}</section>
+      <section class="counter-box">${t.visitorLine} #${visitorTotal.toLocaleString("en-US")}</section>
 
       <section class="button-zone">
         <button class="chaos-button" data-random-button type="button">SEJBOSEJBO</button>
@@ -456,19 +472,19 @@ function renderPager(current, totalPages, hrefFor, t) {
   return `<nav class="pager" aria-label="Pagination">${parts.join("")}</nav>`;
 }
 
-app.get("/gallery", (req, res) => {
+app.get("/gallery", async (req, res) => {
   const t = getCopy(req);
   const perPage = 24;
   const sort = Object.hasOwn(GALLERY_SORTS, req.query.sort) ? req.query.sort : "latest";
   const { statement, count } = GALLERY_SORTS[sort];
 
-  const total = statements[count].get().count;
+  const total = (await statements[count].get()).count;
   const totalPages = Math.max(Math.ceil(total / perPage), 1);
   // Clamp instead of 404ing: a stale bookmark from before posts were
   // deleted should land on the last real page, not an error.
   const page = Math.min(Math.max(Number(req.query.page || 1) || 1, 1), totalPages);
 
-  const visible = statements[statement].all(perPage, (page - 1) * perPage);
+  const visible = await statements[statement].all(perPage, (page - 1) * perPage);
 
   const query = (params) => {
     const parts = Object.entries(params).filter(([, v]) => v !== null && v !== undefined);
@@ -479,7 +495,7 @@ app.get("/gallery", (req, res) => {
   const pageHref = (number) =>
     withLang(req, `/gallery${query({ sort: sort === "latest" ? null : sort, page: number === 1 ? null : number })}`);
 
-  renderPage(req, res, {
+  await renderPage(req, res, {
     title: t.galleryTitle,
     body: `
       <section class="plain-head">
@@ -499,9 +515,9 @@ app.get("/gallery", (req, res) => {
   });
 });
 
-app.get("/upload", (req, res) => {
+app.get("/upload", async (req, res) => {
   const t = getCopy(req);
-  renderPage(req, res, {
+  await renderPage(req, res, {
     title: t.uploadTitle,
     body: `
       <section class="plain-head">
@@ -528,7 +544,7 @@ app.post("/upload", upload.single("image"), async (req, res) => {
   if (!title || (!description && !req.file)) {
     storage.discardTemp(req.file);
     res.status(400);
-    return renderPage(req, res, {
+    return await renderPage(req, res, {
       title: t.uploadErrorTitle,
       body: `<section class="plain-head"><h1>${t.notEnough}</h1><p>${t.notEnoughBody}</p><p><a href="${withLang(req, "/upload")}">${t.tryAgain}</a></p></section>`
     });
@@ -542,13 +558,13 @@ app.post("/upload", upload.single("image"), async (req, res) => {
     storage.discardTemp(req.file);
     console.error(`[upload] failed: ${err.message}`);
     res.status(502);
-    return renderPage(req, res, {
+    return await renderPage(req, res, {
       title: t.uploadErrorTitle,
       body: `<section class="plain-head"><h1>${t.notEnough}</h1><p>${t.notEnoughBody}</p><p><a href="${withLang(req, "/upload")}">${t.tryAgain}</a></p></section>`
     });
   }
 
-  const result = statements.insertUpload.run(
+  const result = await statements.insertUpload.run(
     title.slice(0, 120),
     description.slice(0, 1200),
     req.file ? req.file.filename : null,
@@ -558,18 +574,18 @@ app.post("/upload", upload.single("image"), async (req, res) => {
   res.redirect(withLang(req, `/post/${result.lastInsertRowid}`));
 });
 
-app.get("/post/:id", (req, res) => {
+app.get("/post/:id", async (req, res) => {
   const t = getCopy(req);
-  const post = statements.uploadByIdPublic.get(Number(req.params.id));
+  const post = await statements.uploadByIdPublic.get(Number(req.params.id));
   if (!post) return res.status(404).redirect(withLang(req, "/404"));
   const title = escapeHtml(post.title);
   const description = escapeHtml(post.description || "");
   const media = renderMedia(post, { large: true }, title)
     || `<div class="post-story">${description}</div>`;
   // First page only - the rest load client-side if the thread is long.
-  const comments = statements.commentsForPost.all(post.id, 50, 0);
+  const comments = await statements.commentsForPost.all(post.id, 50, 0);
 
-  renderPage(req, res, {
+  await renderPage(req, res, {
     title: post.title,
     body: `
       <article class="post">
@@ -662,9 +678,9 @@ app.get("/post/:id", (req, res) => {
   });
 });
 
-app.get("/privacy", (req, res) => {
+app.get("/privacy", async (req, res) => {
   const t = getCopy(req);
-  renderPage(req, res, {
+  await renderPage(req, res, {
     title: t.privacyTitle,
     body: `
       <section class="plain-head">
@@ -706,13 +722,13 @@ app.get("/privacy", (req, res) => {
 
 // Play Console stores a fixed URL and rechecks it periodically, so this
 // alias just has to keep resolving - a redirect is fine, a 404 later isn't.
-app.get("/privacy.html", (req, res) => {
+app.get("/privacy.html", async (req, res) => {
   res.redirect(301, withLang(req, "/privacy"));
 });
 
-app.get("/terms", (req, res) => {
+app.get("/terms", async (req, res) => {
   const t = getCopy(req);
-  renderPage(req, res, {
+  await renderPage(req, res, {
     title: t.termsTitle,
     body: `
       <section class="plain-head">
@@ -750,14 +766,14 @@ app.get("/terms", (req, res) => {
   });
 });
 
-app.get("/terms.html", (req, res) => {
+app.get("/terms.html", async (req, res) => {
   res.redirect(301, withLang(req, "/terms"));
 });
 
-app.get("/admin", (req, res) => {
+app.get("/admin", async (req, res) => {
   const t = getCopy(req);
   if (!req.session.isAdmin) {
-    return renderPage(req, res, {
+    return await renderPage(req, res, {
       title: "Admin",
       body: `
         <section class="plain-head">
@@ -773,11 +789,20 @@ app.get("/admin", (req, res) => {
   }
 
   const showReportedOnly = req.query.filter === "reported";
-  const uploads = showReportedOnly ? statements.reportedUploadsAdmin.all() : statements.allUploadsAdmin.all();
+  const uploads = showReportedOnly ? await statements.reportedUploadsAdmin.all() : await statements.allUploadsAdmin.all();
+  // Full rows, not just a tally - what the reporter typed is the whole
+  // point of asking for details, and the count alone discarded it.
+  // Fetched in one pass rather than per row: on a remote database a query
+  // inside the map is a network round trip per post.
+  const reportsByPost = new Map();
+  await Promise.all(
+    uploads.filter((item) => item.report_count > 0).map(async (item) => {
+      reportsByPost.set(item.id, await statements.reportsForPost.all(item.id));
+    })
+  );
+
   const rows = uploads.map((item) => {
-    // Full rows, not just a tally - what the reporter typed is the whole
-    // point of asking for details, and the count alone discarded it.
-    const reportRows = item.report_count > 0 ? statements.reportsForPost.all(item.id) : [];
+    const reportRows = reportsByPost.get(item.id) || [];
 
     return `
     <tr>
@@ -826,12 +851,17 @@ app.get("/admin", (req, res) => {
   `;
   }).join("");
 
-  renderPage(req, res, {
+  const [adminTotal, adminVisitors] = await Promise.all([
+    statements.countAllAdmin.get(),
+    getTotalVisits()
+  ]);
+
+  await renderPage(req, res, {
     title: "Admin",
     body: `
       <section class="plain-head">
         <h1>${t.adminDashboard}</h1>
-        <p>${t.totalUploads}: ${statements.countAllAdmin.get().count.toLocaleString("en-US")} | ${t.visitors}: ${getTotalVisits().toLocaleString("en-US")}</p>
+        <p>${t.totalUploads}: ${adminTotal.count.toLocaleString("en-US")} | ${t.visitors}: ${adminVisitors.toLocaleString("en-US")}</p>
       </section>
       ${adminNav(req, "dashboard")}
       <nav class="sort-switch" aria-label="Filter">
@@ -852,11 +882,20 @@ app.get("/admin", (req, res) => {
   });
 });
 
-app.get("/admin/metrics", requireAdmin, (req, res) => {
+app.get("/admin/metrics", requireAdmin, async (req, res) => {
   const t = getCopy(req);
-  const top = statements.topUploadsAllTime.all(5);
+  // Six independent counters - one round trip instead of six.
+  const [top, mVisitors, mPosts, mHidden, mVotes, mFiled, mOutstanding] = await Promise.all([
+    statements.topUploadsAllTime.all(5),
+    getTotalVisits(),
+    statements.totalUploadsAll.get(),
+    statements.totalUploadsHidden.get(),
+    statements.totalVotesCast.get(),
+    statements.totalReportsFiled.get(),
+    statements.totalReportsOutstanding.get()
+  ]);
 
-  renderPage(req, res, {
+  await renderPage(req, res, {
     title: t.metricsPageHeading,
     body: `
       <section class="plain-head">
@@ -864,12 +903,12 @@ app.get("/admin/metrics", requireAdmin, (req, res) => {
       </section>
       ${adminNav(req, "metrics")}
       <div class="metrics-grid">
-        <div class="metric-tile"><b>${t.metricsVisitors}</b><span>${getTotalVisits().toLocaleString("en-US")}</span></div>
-        <div class="metric-tile"><b>${t.metricsTotalPosts}</b><span>${statements.totalUploadsAll.get().count.toLocaleString("en-US")}</span></div>
-        <div class="metric-tile"><b>${t.metricsHiddenPosts}</b><span>${statements.totalUploadsHidden.get().count.toLocaleString("en-US")}</span></div>
-        <div class="metric-tile"><b>${t.metricsTotalVotes}</b><span>${statements.totalVotesCast.get().total.toLocaleString("en-US")}</span></div>
-        <div class="metric-tile"><b>${t.metricsReportsFiled}</b><span>${statements.totalReportsFiled.get().value.toLocaleString("en-US")}</span></div>
-        <div class="metric-tile"><b>${t.metricsReportsOutstanding}</b><span>${statements.totalReportsOutstanding.get().total.toLocaleString("en-US")}</span></div>
+        <div class="metric-tile"><b>${t.metricsVisitors}</b><span>${mVisitors.toLocaleString("en-US")}</span></div>
+        <div class="metric-tile"><b>${t.metricsTotalPosts}</b><span>${mPosts.count.toLocaleString("en-US")}</span></div>
+        <div class="metric-tile"><b>${t.metricsHiddenPosts}</b><span>${mHidden.count.toLocaleString("en-US")}</span></div>
+        <div class="metric-tile"><b>${t.metricsTotalVotes}</b><span>${mVotes.total.toLocaleString("en-US")}</span></div>
+        <div class="metric-tile"><b>${t.metricsReportsFiled}</b><span>${mFiled.value.toLocaleString("en-US")}</span></div>
+        <div class="metric-tile"><b>${t.metricsReportsOutstanding}</b><span>${mOutstanding.total.toLocaleString("en-US")}</span></div>
       </div>
       <h2>${t.metricsTopPosts}</h2>
       <div class="table-wrap">
@@ -892,11 +931,11 @@ app.get("/admin/metrics", requireAdmin, (req, res) => {
   });
 });
 
-app.get("/admin/comments", requireAdmin, (req, res) => {
+app.get("/admin/comments", requireAdmin, async (req, res) => {
   const t = getCopy(req);
-  const rows = statements.recentCommentsAdmin.all(200);
+  const rows = await statements.recentCommentsAdmin.all(200);
 
-  renderPage(req, res, {
+  await renderPage(req, res, {
     title: t.adminNavComments,
     body: `
       <section class="plain-head"><h1>${t.commentsPageHeading}</h1></section>
@@ -930,23 +969,26 @@ app.get("/admin/comments", requireAdmin, (req, res) => {
   });
 });
 
-app.post("/admin/comment/:id/toggle", requireAdmin, (req, res) => {
-  moderateComment(Number(req.params.id));
+app.post("/admin/comment/:id/toggle", requireAdmin, async (req, res) => {
+  await moderateComment(Number(req.params.id));
   res.redirect(withLang(req, "/admin/comments"));
 });
 
-app.post("/admin/comment/:id/delete", requireAdmin, (req, res) => {
-  moderateComment(Number(req.params.id), { remove: true });
+app.post("/admin/comment/:id/delete", requireAdmin, async (req, res) => {
+  await moderateComment(Number(req.params.id), { remove: true });
   res.redirect(withLang(req, "/admin/comments"));
 });
 
-app.get("/admin/settings", requireAdmin, (req, res) => {
+app.get("/admin/settings", requireAdmin, async (req, res) => {
   const t = getCopy(req);
   const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
   const aiConfig = ai.describeConfig();
-  const aiRows = statements.allAiContent.all();
+  const [aiRows, notifyEmail] = await Promise.all([
+    statements.allAiContent.all(),
+    getNotifyEmail()
+  ]);
 
-  renderPage(req, res, {
+  await renderPage(req, res, {
     title: t.settingsPageHeading,
     body: `
       <section class="plain-head">
@@ -955,7 +997,7 @@ app.get("/admin/settings", requireAdmin, (req, res) => {
       ${adminNav(req, "settings")}
       <form class="form skinny" method="post" action="${withLang(req, "/admin/settings")}">
         <label>${t.notifyEmailLabel}
-          <input type="email" name="notify_email" value="${escapeHtml(getNotifyEmail() || "")}" placeholder="${t.notifyEmailPlaceholder}">
+          <input type="email" name="notify_email" value="${escapeHtml(notifyEmail || "")}" placeholder="${t.notifyEmailPlaceholder}">
         </label>
         <p class="smtp-status">${smtpConfigured ? t.smtpConfigured : t.smtpNotConfigured}</p>
         <button type="submit">${t.save}</button>
@@ -1005,8 +1047,8 @@ app.get("/admin/settings", requireAdmin, (req, res) => {
   });
 });
 
-app.post("/admin/settings", requireAdmin, (req, res) => {
-  setNotifyEmail(String(req.body.notify_email || "").trim().slice(0, 200));
+app.post("/admin/settings", requireAdmin, async (req, res) => {
+  await setNotifyEmail(String(req.body.notify_email || "").trim().slice(0, 200));
   res.redirect(withLang(req, "/admin/settings"));
 });
 
@@ -1028,7 +1070,7 @@ app.post("/admin/smtp/test", requireAdminJson, async (req, res) => {
   }
 });
 
-app.post("/admin/ai/regenerate", requireAdmin, (req, res) => {
+app.post("/admin/ai/regenerate", requireAdmin, async (req, res) => {
   // Kicked off in the background and redirected immediately: on a Pi this
   // takes minutes, and holding the admin's request open that long would
   // just time out somewhere in the proxy chain.
@@ -1041,79 +1083,86 @@ app.post("/admin/ai/regenerate", requireAdmin, (req, res) => {
   res.redirect(withLang(req, "/admin/settings"));
 });
 
-app.post("/admin/login", (req, res) => {
+app.post("/admin/login", async (req, res) => {
   const t = getCopy(req);
   if (String(req.body.password || "") === ADMIN_PASSWORD) {
     req.session.isAdmin = true;
     return res.redirect(withLang(req, "/admin"));
   }
   res.status(401);
-  return renderPage(req, res, {
+  return await renderPage(req, res, {
     title: t.nope,
     body: `<section class="plain-head"><h1>${t.nope}</h1><p>${t.badPassword}</p><p><a href="${withLang(req, "/admin")}">${t.tryAgain}</a></p></section>`
   });
 });
 
-app.post("/admin/logout", requireAdmin, (req, res) => {
+app.post("/admin/logout", requireAdmin, async (req, res) => {
   req.session.isAdmin = false;
   res.redirect(withLang(req, "/"));
 });
 
-app.post("/admin/reset-visits", requireAdmin, (req, res) => {
-  statements.resetVisits.run();
+app.post("/admin/reset-visits", requireAdmin, async (req, res) => {
+  await statements.resetVisits.run();
   req.session.countedVisit = true;
   res.redirect(withLang(req, "/admin"));
 });
 
-app.post("/admin/upload/:id/flags", requireAdmin, (req, res) => {
-  statements.updateFlag.run(req.body.hidden ? 1 : 0, req.body.pinned ? 1 : 0, req.body.featured ? 1 : 0, Number(req.params.id));
+app.post("/admin/upload/:id/flags", requireAdmin, async (req, res) => {
+  // Booleans now, not 0/1 - the columns are real BOOLEAN in Postgres.
+  await statements.updateFlag.run(!!req.body.hidden, !!req.body.pinned, !!req.body.featured, Number(req.params.id));
   res.redirect(withLang(req, "/admin"));
 });
 
 app.post("/admin/upload/:id/delete", requireAdmin, async (req, res) => {
-  const uploadRow = statements.uploadByIdAny.get(Number(req.params.id));
+  const uploadRow = await statements.uploadByIdAny.get(Number(req.params.id));
   if (uploadRow?.filename) {
     await storage.remove(uploadRow.filename);
   }
-  statements.deleteUpload.run(Number(req.params.id));
+  await statements.deleteUpload.run(Number(req.params.id));
   res.redirect(withLang(req, "/admin"));
 });
 
-app.post("/admin/upload/:id/clear-reports", requireAdmin, (req, res) => {
-  clearReports(Number(req.params.id));
+app.post("/admin/upload/:id/clear-reports", requireAdmin, async (req, res) => {
+  await clearReports(Number(req.params.id));
   res.redirect(withLang(req, req.get("Referer")?.includes("filter=reported") ? "/admin?filter=reported" : "/admin"));
 });
 
-app.get("/api/random-phrase", (req, res) => {
+app.get("/api/random-phrase", async (req, res) => {
   const t = getCopy(req);
   const phrases = ai.getPhrases(getLang(req));
   res.json({ phrase: phrases[Math.floor(Math.random() * phrases.length)] });
 });
 
-app.get("/health", (req, res) => {
+app.get("/health", async (req, res) => {
   res.json({
     ok: true,
-    visits: getTotalVisits(),
-    uploads: statements.totalUploads.get().count
+    visits: await getTotalVisits(),
+    uploads: (await statements.totalUploads.get()).count
   });
 });
 
-app.get("/404", (req, res) => {
+app.get("/404", async (req, res) => {
   const t = getCopy(req);
   res.status(404);
-  renderPage(req, res, {
+  await renderPage(req, res, {
     title: "404",
     body: `<section class="not-found"><h1>404</h1><p>${t.missingPage}</p><p><a href="${withLang(req, "/")}">${t.goHome}</a></p></section>`
   });
 });
 
-app.use((err, req, res, next) => {
+app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   const t = getCopy(req);
   console.error(err);
-  res.status(400);
+  res.status(err.status && err.status >= 400 && err.status < 600 ? err.status : 500);
+  // Rendering the error page reads the database too, so it can fail for
+  // the very reason we are here. Degrade to plain text instead of
+  // rejecting out of the last handler in the chain.
   renderPage(req, res, {
     title: t.errorTitle,
     body: `<section class="plain-head"><h1>${t.detected}</h1><p>${escapeHtml(err.message || t.genericError)}</p><p><a href="${withLang(req, "/upload")}">${t.backToUpload}</a></p></section>`
+  }).catch((renderErr) => {
+    console.error(`[error-page] could not render: ${renderErr.message}`);
+    if (!res.headersSent) res.type("text/plain").send(t.genericError);
   });
 });
 
@@ -1121,7 +1170,32 @@ app.use((req, res) => {
   res.redirect(withLang(req, "/404"));
 });
 
-app.listen(PORT, () => {
-  console.log(`sejbosejbo.fyi running at http://localhost:${PORT}`);
-  ai.start();
+/** The schema check and the AI content cache both have to finish before the
+ * first request arrives - with sqlite they happened synchronously at require
+ * time, but a remote database can't be set up as a side effect of loading a
+ * module. Binding the port only after they resolve means the container is
+ * never briefly listening-but-broken.
+ *
+ * A failure here is fatal on purpose: a site that can't reach its database
+ * has nothing to serve, and exiting lets Docker's restart policy retry
+ * rather than leaving a process up that 500s every request. */
+async function main() {
+  await initDb();
+  await ai.start();
+
+  app.listen(PORT, () => {
+    console.log(`sejbosejbo.fyi running at http://localhost:${PORT}`);
+  });
+}
+
+main().catch((err) => {
+  // A failed connection often arrives as an AggregateError whose .message
+  // is empty, so printing only that gives an operator "[startup] failed:"
+  // and nothing to act on. Say what we tried to reach and dump the causes.
+  const target = `${process.env.PGHOST || "localhost"}:${process.env.PGPORT || 5432}/${process.env.PGDATABASE || "(no PGDATABASE)"}`;
+  console.error(`[startup] failed connecting to postgres at ${target} as ${process.env.PGUSER || "(no PGUSER)"}`);
+  if (err.message) console.error(`  ${err.message}`);
+  for (const cause of err.errors || []) console.error(`  - ${cause.message}`);
+  if (!err.message && !err.errors?.length) console.error(`  ${err}`);
+  process.exit(1);
 });

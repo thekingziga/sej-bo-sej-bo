@@ -28,19 +28,19 @@ function getTransporter() {
   return transporter;
 }
 
-function getNotifyEmail() {
-  return statements.getSetting.get("notify_email")?.value || null;
+async function getNotifyEmail() {
+  return (await statements.getSetting.get("notify_email"))?.value || null;
 }
 
-function setNotifyEmail(email) {
-  statements.setSetting.run("notify_email", email || "");
+async function setNotifyEmail(email) {
+  await statements.setSetting.run("notify_email", email || "");
 }
 
 /** Fire-and-forget - a report should never fail, or slow down, because
  * email delivery is broken or unconfigured. Errors are logged, not thrown. */
 async function sendReportNotification({ post, reason, details }) {
   const transport = getTransporter();
-  const to = getNotifyEmail();
+  const to = await getNotifyEmail();
   if (!transport || !to) return;
 
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
@@ -69,7 +69,7 @@ async function sendReportNotification({ post, reason, details }) {
  * point is to surface a broken config, so a silent success would be
  * useless. Errors are returned as text rather than thrown. */
 async function sendTestEmail() {
-  const to = getNotifyEmail();
+  const to = await getNotifyEmail();
   if (!to) {
     return { ok: false, message: "No notify email set. Save one above first." };
   }

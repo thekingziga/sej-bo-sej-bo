@@ -1,6 +1,6 @@
 {
   "name": "sejbosejbo-fyi",
-  "version": "1.14.0",
+  "version": "1.15.0",
   "description": "A deliberately simple chaotic meme website for declaring things Sejbosejbo.",
   "main": "server.js",
   "scripts": {
@@ -14,6 +14,7 @@
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.0.2",
     "nodemailer": "^9.0.3",
+    "pg": "^8.23.0",
     "stripe": "^18.5.0"
   },
   "engines": {

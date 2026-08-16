@@ -45,6 +45,19 @@ services:
       OLLAMA_TIMEOUT_MS: "${OLLAMA_TIMEOUT_MS:-180000}"
       # Audio/video uploads. Off unless explicitly "true".
       ENABLE_MEDIA_UPLOADS: "${ENABLE_MEDIA_UPLOADS:-false}"
+      # Postgres. The app will not start without these - it has no
+      # embedded-database fallback any more.
+      PGHOST: "${PGHOST:-}"
+      PGPORT: "${PGPORT:-5432}"
+      PGUSER: "${PGUSER:-}"
+      PGPASSWORD: "${PGPASSWORD:-}"
+      PGDATABASE: "${PGDATABASE:-}"
+      # Pool ceiling. The database server's max_connections is shared with
+      # other apps, so this is deliberately well under the role's limit.
+      PGPOOL_MAX: "${PGPOOL_MAX:-10}"
+      # Site-facing timezone: page timestamps and the Sejbometer's day
+      # boundary. Storage stays UTC; the JSON API stays UTC.
+      SITE_TIMEZONE: "${SITE_TIMEZONE:-Europe/Ljubljana}"
       # File storage. "local" (default) uses the ./uploads bind mount below;
       # "s3" needs the four S3_* vars or it falls back to local.
       STORAGE_DRIVER: "${STORAGE_DRIVER:-local}"

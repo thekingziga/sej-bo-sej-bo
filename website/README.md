@@ -25,10 +25,47 @@ If `ADMIN_PASSWORD` is not set, the local default is `sejbosejbo`.
 
 ## Data
 
-- SQLite database: `data/sejbosejbo.sqlite`
+- Database: **Postgres** (connection via the `PG*` variables — see `deploy/.env.example`)
 - Uploaded images/GIFs: `uploads/`
+- `data/` now only holds the legacy `sejbosejbo.sqlite` file, kept as a rollback
 
-Both are ignored by git so the site can keep its local archive separate from the code.
+`uploads/` and `data/` are ignored by git so the site can keep its archive
+separate from the code.
+
+### Moving from SQLite to Postgres
+
+The app used to embed SQLite. It now requires Postgres and will exit on
+startup if it cannot reach it — there is no fallback, so that a
+misconfigured deployment fails loudly instead of quietly serving an empty
+site from a database nobody meant to create.
+
+**Create the database as UTF8.** `SQL_ASCII` stores Slovenian text without
+complaint but miscounts and mis-cases it: `length('Čšž')` returns 6, and
+`upper('čšž')` returns `čšž` unchanged. ICU with `sl-SI` additionally sorts
+č/š/ž correctly:
+
+```sql
+CREATE DATABASE sejbosejbo
+  WITH OWNER = sejbosejbo TEMPLATE = template0 ENCODING = 'UTF8'
+       LOCALE_PROVIDER = icu ICU_LOCALE = 'sl-SI'
+       LC_COLLATE = 'C' LC_CTYPE = 'C';
+```
+
+Then copy the data across — dry run first:
+
+```bash
+docker compose exec sejbosejbo node scripts/migrate-sqlite-to-postgres.js --dry-run
+```
+
+Drop `--dry-run` to do it for real. The script preserves row ids (image
+filenames and `/post/<id>` links depend on them), truncates and reloads
+inside one transaction so a half-finished run can't leave a partial
+database, fast-forwards the identity sequences, and verifies row counts
+against the source. It opens the SQLite file read-only and never writes to
+it, so `data/sejbosejbo.sqlite` remains a valid rollback.
+
+To roll back: point the container at the previous image and the SQLite
+file is still exactly as it was.
 
 ### Moving uploads to S3
 

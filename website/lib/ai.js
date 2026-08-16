@@ -280,7 +280,8 @@ async function generateList(kind, lang) {
   const shots = [...(SHOTS[kind].en || []), ...(SHOTS[kind].sl || [])];
   const cleaned = cleanStringList(parsed, spec, shots);
   if (!cleaned) throw new Error(`${kind}/${lang}: model returned unusable output`);
-  statements.setAiContent.run(kind, lang, JSON.stringify(cleaned));
+  await statements.setAiContent.run(kind, lang, JSON.stringify(cleaned));
+  contentCache.set(`${kind}:${lang}`, JSON.stringify(cleaned));
   return cleaned;
 }
 
@@ -289,7 +290,7 @@ async function generateList(kind, lang) {
  * being stored - a hallucinated id falls back to the deterministic
  * date-hash pick rather than 500ing or showing a hidden post. */
 async function generateDailyAward() {
-  const posts = statements.dailyPool.all();
+  const posts = await statements.dailyPool.all();
   if (!posts.length) throw new Error("award: no posts to choose from");
 
   // Cap the candidate list - a tiny model's context is small and long
@@ -309,21 +310,51 @@ Respond with only JSON: {"id": <the number>}`);
   const match = candidates.find((p) => p.id === chosenId);
   if (!match) throw new Error(`award: model picked ${parsed?.id}, not a valid candidate`);
 
-  statements.setAiContent.run("daily_award", "", JSON.stringify({ id: match.id, date: today() }));
+  const awardValue = JSON.stringify({ id: match.id, date: today() });
+  await statements.setAiContent.run("daily_award", "", awardValue);
+  contentCache.set("daily_award:", awardValue);
   return match;
 }
 
+/** The site's current calendar day, in the site's timezone - so the daily
+ * award changes at local midnight rather than at 01:00/02:00 Slovenian
+ * time, which is what UTC worked out to. en-CA formats as YYYY-MM-DD. */
 function today() {
-  return new Date().toISOString().slice(0, 10);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: process.env.SITE_TIMEZONE || "Europe/Ljubljana"
+  }).format(new Date());
 }
 
 // ------------------------------------------------------------- readers ---
 
-function readCachedList(kind, lang) {
-  const row = statements.getAiContent.get(kind, lang);
-  if (!row) return null;
+/** In-memory mirror of the ai_content table, keyed "kind:lang".
+ *
+ * The accessors below run on every page render, and the database now lives
+ * on another machine - reading it per render would put a network round trip
+ * in front of every request to serve copy that only changes every few
+ * hours. This is loaded at startup and refreshed after each generation, so
+ * the getters stay synchronous and free. */
+const contentCache = new Map();
+
+/** Repopulates the whole cache from the database. Cheap (a handful of
+ * rows), so it re-reads everything rather than tracking dirty keys. */
+async function reloadContentCache() {
   try {
-    const parsed = JSON.parse(row.value);
+    const rows = await statements.allAiContent.all();
+    contentCache.clear();
+    for (const row of rows) contentCache.set(`${row.key}:${row.lang}`, row.value);
+  } catch (err) {
+    // A failed reload leaves the previous cache in place; the curated i18n
+    // arrays are the floor either way, so this can't break a page render.
+    console.error(`[ai] could not load content cache: ${err.message}`);
+  }
+}
+
+function readCachedList(kind, lang) {
+  const raw = contentCache.get(`${kind}:${lang}`);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
     return Array.isArray(parsed) && parsed.length ? parsed : null;
   } catch {
     return null;
@@ -352,13 +383,15 @@ function getExamples(lang) {
  * visible. Returns null so the caller can use the existing deterministic
  * pick - which is what runs whenever AI is off, stale, or the post got
  * hidden or deleted since. */
-function getDailyAwardPost() {
-  const row = statements.getAiContent.get("daily_award", "");
-  if (!row) return null;
+/** Async because it resolves the winning post, which is a real row read -
+ * unlike the list accessors above, which the in-memory cache keeps free. */
+async function getDailyAwardPost() {
+  const raw = contentCache.get("daily_award:");
+  if (!raw) return null;
   try {
-    const parsed = JSON.parse(row.value);
+    const parsed = JSON.parse(raw);
     if (parsed.date !== today()) return null;
-    return statements.uploadByIdPublic.get(Number(parsed.id)) || null;
+    return (await statements.uploadByIdPublic.get(Number(parsed.id))) || null;
   } catch {
     return null;
   }
@@ -459,7 +492,7 @@ async function refreshContent({ force = false } = {}) {
   try {
     for (const kind of ["quotes", "phrases", "examples"]) {
       for (const lang of ["en", "sl"]) {
-        const existing = statements.getAiContent.get(kind, lang);
+        const existing = await statements.getAiContent.get(kind, lang);
         const age = existing ? Date.now() - new Date(`${existing.updated_at}Z`).getTime() : Infinity;
         if (!force && age < CONTENT_INTERVAL_MS) continue;
         try {
@@ -481,7 +514,7 @@ async function refreshContent({ force = false } = {}) {
 
 async function refreshAward({ force = false } = {}) {
   if (!isEnabled()) return { skipped: true };
-  const row = statements.getAiContent.get("daily_award", "");
+  const row = await statements.getAiContent.get("daily_award", "");
   if (!force && row) {
     try {
       if (JSON.parse(row.value).date === today()) return { skipped: true };
@@ -498,7 +531,12 @@ async function refreshAward({ force = false } = {}) {
   }
 }
 
-function start() {
+async function start() {
+  // Always prime the cache, even with no provider configured: rows written
+  // by a previous run (or before AI was switched off) are still the best
+  // copy available, and the getters read only from memory now.
+  await reloadContentCache();
+
   if (!isEnabled()) {
     console.log("[ai] no provider configured - using the built-in phrase lists.");
     return;
