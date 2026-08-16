@@ -13,6 +13,12 @@
  * then remove ./uploads by hand when you're satisfied.
  *
  * Pass --dry-run to list what would be copied without transferring anything.
+ *
+ * Pass --mirror to target the S3_MIRROR_* bucket instead of the primary.
+ * That is how the mirror gets backfilled the first time, and how it heals
+ * after a mirror write failed during an upload (those are logged and
+ * deliberately not retried inline, so the mirror can drift). Safe to run on
+ * a schedule - it re-uploads, which just overwrites identical objects.
  */
 const fs = require("fs");
 const path = require("path");
@@ -21,6 +27,7 @@ const { statements, uploadDir } = require("../lib/db");
 const storage = require("../lib/storage");
 
 const dryRun = process.argv.includes("--dry-run");
+const toMirror = process.argv.includes("--mirror");
 
 async function main() {
   if (!storage.isRemote()) {
@@ -29,8 +36,15 @@ async function main() {
     process.exit(1);
   }
 
-  const rows = statements.allUploadsAdmin.all().filter((r) => r.filename);
-  console.log(`${rows.length} rows reference a file. Target: ${storage.describe()}\n`);
+  const target = toMirror ? storage._internal.MIRROR : storage._internal.S3;
+  if (toMirror && !storage._internal.bucketConfigured(target)) {
+    console.error("--mirror given but the S3_MIRROR_* vars are incomplete.");
+    process.exit(1);
+  }
+
+  const rows = (await statements.allUploadsAdmin.all()).filter((r) => r.filename);
+  console.log(`${rows.length} rows reference a file.`);
+  console.log(`target: ${target.label} bucket ${target.bucket} at ${target.endpoint}${target.prefix ? ` (prefix ${target.prefix})` : ""}${dryRun ? "  [DRY RUN]" : ""}\n`);
 
   let copied = 0;
   let missing = 0;
@@ -51,7 +65,7 @@ async function main() {
     try {
       // commit() deletes the local temp file, which is exactly what we do
       // NOT want here - so push the bytes directly instead.
-      await storage._internal.s3Put(row.filename, fs.readFileSync(localPath));
+      await storage._internal.s3Put(row.filename, fs.readFileSync(localPath), target);
       console.log(`OK       #${row.id} ${row.filename}`);
       copied++;
     } catch (err) {

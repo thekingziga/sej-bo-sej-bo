@@ -68,6 +68,13 @@ services:
       S3_REGION: "${S3_REGION:-us-east-1}"
       S3_PREFIX: "${S3_PREFIX:-}"
       S3_PUBLIC_BASE_URL: "${S3_PUBLIC_BASE_URL:-}"
+      # Optional second bucket receiving a copy of every upload. Blank = off.
+      S3_MIRROR_BUCKET: "${S3_MIRROR_BUCKET:-}"
+      S3_MIRROR_ENDPOINT: "${S3_MIRROR_ENDPOINT:-}"
+      S3_MIRROR_ACCESS_KEY_ID: "${S3_MIRROR_ACCESS_KEY_ID:-}"
+      S3_MIRROR_SECRET_ACCESS_KEY: "${S3_MIRROR_SECRET_ACCESS_KEY:-}"
+      S3_MIRROR_REGION: "${S3_MIRROR_REGION:-us-east-1}"
+      S3_MIRROR_PREFIX: "${S3_MIRROR_PREFIX:-}"
     volumes:
       - ./data:/app/data
       - ./uploads:/app/uploads

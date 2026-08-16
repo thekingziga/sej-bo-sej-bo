@@ -102,6 +102,67 @@ still there because the migration never deleted them.
 A half-configured bucket (driver set to `s3` but a var missing) logs an
 error and falls back to local disk rather than taking the site down.
 
+### Mirroring uploads to a second bucket
+
+Set the `S3_MIRROR_*` vars and every upload is written to both buckets, so
+losing one provider — or deleting the wrong bucket — doesn't lose the files.
+
+The two writes are deliberately not equal. The **primary must succeed**,
+because the database row that gets written points at that object. The
+**mirror is best-effort**: if it fails, the upload is still accepted and a
+warning is logged. A second bucket exists to make the site more durable, not
+to give it a second thing that can reject a post.
+
+That means the mirror can drift. Backfill it the first time, and heal it
+afterwards, with:
+
+```bash
+docker compose exec sejbosejbo node scripts/migrate-uploads-to-s3.js --mirror
+```
+
+Safe to run on a schedule — it re-uploads, which just overwrites identical
+objects.
+
+Deletes go to both buckets, so removing a post in admin doesn't leave the
+file resurrectable from the mirror.
+
+## Database Backups
+
+`scripts/backup-database.sh` writes a compressed `pg_dump` to `db-backups/`
+and prunes anything older than `BACKUP_KEEP_DAYS`. It runs on the host (from
+cron), not in the container, and uses the official `postgres` image so the Pi
+needs no client tools installed.
+
+```bash
+./backup-database.sh            # take a backup
+./backup-database.sh --verify   # take one, then restore it into a throwaway
+                                # database and print the row counts
+```
+
+Installed on the Pi as a nightly job at 03:30 local, with the weekly Sunday
+run using `--verify`.
+
+**Why dumps rather than a replica.** A streaming replica protects against the
+database *server* dying. It does not protect against the *data* being
+destroyed: a dropped table, a bad migration, or deleting the wrong post
+replicates to the standby within milliseconds, and then it is gone twice.
+These dumps are what lets you go back to how yesterday looked. Run
+replication too if you want a hot standby — but only the dumps are a backup.
+
+The script refuses to keep a dump that doesn't contain the schema, so a
+silently-empty backup can't sit there looking like success.
+
+To restore:
+
+```bash
+gunzip -c db-backups/sejbosejbo-YYYYMMDD-HHMMSS.sql.gz \
+  | docker run --rm -i -e PGPASSWORD="$PGPASSWORD" postgres:17-alpine \
+      psql -h "$PGHOST" -U "$PGUSER" -d "$PGDATABASE"
+```
+
+The dump is taken with `--clean --if-exists`, so it restores straight over an
+existing database.
+
 ## JSON API
 
 Everything under `/api/v1` is documented in full in
