@@ -241,9 +241,7 @@ function layout({ title, body, stats, req }) {
       commentEmpty: t.commentEmpty,
       commentReport: t.commentReport,
       commentReported: t.commentReported,
-      commentReportFailed: t.commentReportFailed,
-      commentReportBadReason: t.commentReportBadReason,
-      commentReportPrompt: t.commentReportPrompt
+      commentReportFailed: t.commentReportFailed
     })};
   </script>
   <script src="/public/main.js"></script>
@@ -635,6 +633,25 @@ app.get("/post/:id", (req, res) => {
                       <time>${formatDate(c.created_at)}</time>
                       <button type="button" class="comment-report" data-comment-report="${c.id}">${t.commentReport}</button>
                     </div>
+                    <form class="report-form comment-report-form" data-comment-report-form="${c.id}" hidden>
+                      <label>${t.reportReasonLabel}
+                        <select name="reason" required>
+                          <option value="spam">${t.reportReasonSpam}</option>
+                          <option value="inappropriate" selected>${t.reportReasonInappropriate}</option>
+                          <option value="harassment">${t.reportReasonHarassment}</option>
+                          <option value="copyright">${t.reportReasonCopyright}</option>
+                          <option value="other">${t.reportReasonOther}</option>
+                        </select>
+                      </label>
+                      <label>${t.reportDetailsLabel}
+                        <textarea name="details" maxlength="500" rows="2" placeholder="${t.reportDetailsPlaceholder}"></textarea>
+                      </label>
+                      <div class="report-actions">
+                        <button type="submit">${t.reportSubmit}</button>
+                        <button type="button" data-comment-report-cancel>${t.reportCancel}</button>
+                      </div>
+                      <p class="report-status" data-comment-report-status role="status"></p>
+                    </form>
                   </li>
                 `).join("")
               : `<li class="comment empty" data-comment-empty>${t.commentsEmpty}</li>`

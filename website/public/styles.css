@@ -595,6 +595,15 @@ textarea {
   display: none;
 }
 
+/* Same widget nested inside a comment - tighter, and set apart from the
+   comment body above it. */
+.comment-report-form {
+  margin-top: 10px;
+  gap: 8px;
+  padding: 12px;
+  box-shadow: 3px 3px 0 var(--line);
+}
+
 .report-form label {
   font-size: 14px;
 }

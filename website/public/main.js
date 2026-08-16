@@ -309,34 +309,53 @@ document.querySelectorAll("[data-comment-vote-widget]").forEach((widget) => {
 
 // --- Reporting a comment -----------------------------------------------------
 
+// A dropdown of the five reasons the API actually accepts, matching the
+// post report widget. This used to be a window.prompt() the visitor typed
+// into freehand, which could only ever produce one of five exact strings -
+// anything else was rejected after the fact, and "spam!!" or "Spam " read
+// as a bug rather than a validation rule.
 document.querySelectorAll("[data-comment-report]").forEach((button) => {
-  button.addEventListener("click", async () => {
-    const copy = window.SEJBOSEJBO_COPY || {};
-    const commentId = button.dataset.commentReport;
-    const reason = window.prompt(copy.commentReportPrompt || "Why are you reporting this? (spam, inappropriate, harassment, copyright, other)", "inappropriate");
-    if (reason === null) return;
+  const commentId = button.dataset.commentReport;
+  const form = document.querySelector(`[data-comment-report-form="${commentId}"]`);
+  if (!form) return;
 
-    const cleaned = String(reason).trim().toLowerCase();
-    if (!["spam", "inappropriate", "harassment", "copyright", "other"].includes(cleaned)) {
-      button.textContent = copy.commentReportBadReason || "unknown reason";
-      setTimeout(() => { button.textContent = copy.commentReport || "report"; }, 1800);
-      return;
-    }
+  const status = form.querySelector("[data-comment-report-status]");
+  const copy = () => window.SEJBOSEJBO_COPY || {};
 
-    button.disabled = true;
+  button.addEventListener("click", () => {
+    const opening = form.hidden;
+    form.hidden = !opening;
+    if (opening) form.querySelector("select")?.focus();
+  });
+
+  form.querySelector("[data-comment-report-cancel]")?.addEventListener("click", () => {
+    form.hidden = true;
+    if (status) status.textContent = "";
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = form.querySelector("button[type=submit]");
+    const reason = form.querySelector("select[name=reason]").value;
+    const details = form.querySelector("textarea[name=details]").value.trim();
+
+    if (submit) submit.disabled = true;
+    if (status) status.textContent = "";
+
     try {
       const response = await fetch(`/api/v1/comments/${commentId}/report`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: cleaned })
+        body: JSON.stringify(details ? { reason, details } : { reason })
       });
       if (!response.ok) throw new Error("failed");
-      button.textContent = copy.commentReported || "reported";
+      form.hidden = true;
+      button.textContent = copy().commentReported || "reported";
       button.classList.add("done");
+      button.disabled = true;
     } catch {
-      button.textContent = copy.commentReportFailed || "failed";
-      button.disabled = false;
-      setTimeout(() => { button.textContent = copy.commentReport || "report"; }, 1800);
+      if (status) status.textContent = copy().reportFailed || "Report failed. Try again.";
+      if (submit) submit.disabled = false;
     }
   });
 });

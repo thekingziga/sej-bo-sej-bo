@@ -159,7 +159,15 @@ function extractJson(text) {
  * page, so it gets the same treatment as a user upload: right shape, sane
  * length, no empties. Returns null (keep the fallback) rather than
  * publishing something malformed. */
-function cleanStringList(value, { min, max, maxLength }) {
+/** Loose key for "is this the same line?" - lowercased, trailing punctuation
+ * and whitespace removed. The few-shot examples for quotes end in a period
+ * and the ones for phrases don't, and models mix the two, so an exact
+ * comparison would miss half the echoes. */
+function sameLineKey(text) {
+  return text.toLowerCase().replace(/[.!?…\s]+$/u, "").trim();
+}
+
+function cleanStringList(value, { min, max, maxLength }, exclude = []) {
   // Asked for a bare JSON array, qwen2.5:0.5b actually returns
   // {"funny_strings": [...]} - it invents a wrapper key, and the key name
   // changes with the prompt. So: take the array if we got one, otherwise
@@ -187,8 +195,23 @@ function cleanStringList(value, { min, max, maxLength }) {
       .trim())
     .filter((item) => item.length > 0 && item.length <= maxLength);
 
-  if (cleaned.length < min) return null;
-  return cleaned.slice(0, max);
+  // Models routinely hand the few-shot examples straight back as if they
+  // were new - on real output more than half of one list was the prompt
+  // echoed verbatim. Those look plausible on the page (they're the curated
+  // fallback strings, after all), so nothing catches it downstream: the
+  // site quietly pays for generation and displays its own hardcoded copy.
+  // Drop anything matching a shot, and any duplicate within the list.
+  const seen = new Set(exclude.map(sameLineKey));
+  const fresh = [];
+  for (const item of cleaned) {
+    const key = sameLineKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    fresh.push(item);
+  }
+
+  if (fresh.length < min) return null;
+  return fresh.slice(0, max);
 }
 
 const LANG_NAME = { en: "English", sl: "Slovenian" };
@@ -233,6 +256,7 @@ ${shots}
 
 Now write ${ask.count} NEW ones in ${language}: ${ask.what}.
 Rules: match the style above exactly. Everyday and specific, never surreal or fantastical. Each under ${ask.limit} characters. No hashtags, no emoji, no explanations.
+Every line must be new. Do not repeat, translate or lightly reword any of the examples above.
 
 Respond with only a JSON array of ${ask.count} strings.`;
 }
@@ -251,7 +275,10 @@ async function generateList(kind, lang) {
   const spec = SPECS[kind];
   const raw = await callModel(promptFor(kind, lang));
   const parsed = extractJson(raw);
-  const cleaned = cleanStringList(parsed, spec);
+  // Exclude the shots this prompt showed - both languages, since a model
+  // asked for Slovenian sometimes echoes the English examples back.
+  const shots = [...(SHOTS[kind].en || []), ...(SHOTS[kind].sl || [])];
+  const cleaned = cleanStringList(parsed, spec, shots);
   if (!cleaned) throw new Error(`${kind}/${lang}: model returned unusable output`);
   statements.setAiContent.run(kind, lang, JSON.stringify(cleaned));
   return cleaned;
@@ -505,5 +532,8 @@ module.exports = {
   getDailyAwardPost,
   refreshContent,
   refreshAward,
-  start
+  start,
+  // exported for tests - the shot-dedupe is easy to regress silently,
+  // since echoed output looks perfectly valid on the page
+  _internal: { cleanStringList, SHOTS }
 };
