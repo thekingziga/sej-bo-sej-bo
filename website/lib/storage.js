@@ -211,11 +211,36 @@ async function s3Delete(filename, cfg = S3) {
  * same host - S3 URLs are absolute and origin-independent. */
 function publicUrl(filename, origin = "") {
   if (!filename) return null;
-  if (usingS3) {
-    const base = S3.publicBaseUrl || `${S3.endpoint}/${S3.bucket}`;
-    return `${base}/${keyFor(filename)}`;
+
+  // Only send browsers straight at the bucket when there is a URL they can
+  // actually reach: a CDN or a public bucket domain, set deliberately via
+  // S3_PUBLIC_BASE_URL.
+  //
+  // Otherwise keep serving from this app's own /uploads path and let it
+  // fetch from the bucket. That is the right default for a self-hosted
+  // MinIO, which is typically on a private address a visitor's browser
+  // cannot route to, and often a private bucket besides. It also means the
+  // storage swap is invisible from outside: links people already shared,
+  // the app's cached image_url values, and og:image previews all keep
+  // working, and the bucket needs no public read policy.
+  if (usingS3 && S3.publicBaseUrl) {
+    return `${S3.publicBaseUrl}/${keyFor(filename)}`;
   }
   return `${origin}/uploads/${encodeURIComponent(filename)}`;
+}
+
+/** True when uploads are in a bucket that browsers can't reach directly, so
+ * this app has to serve them itself. */
+function servesFromApp() {
+  return usingS3 && !S3.publicBaseUrl;
+}
+
+/** Fetches an object for the app to stream back to a visitor. Returns the
+ * raw fetch Response so the caller can pass through status, content-type
+ * and length without buffering the whole file in memory. */
+async function getObject(filename) {
+  const url = objectUrl(filename, S3);
+  return fetch(url, { headers: signedHeaders({ method: "GET", url, cfg: S3 }) });
 }
 
 /** Moves a freshly-uploaded temp file into permanent storage.
@@ -295,6 +320,8 @@ module.exports = {
   describe,
   isRemote: () => usingS3,
   isMirroring: () => mirroring,
+  servesFromApp,
+  getObject,
   // exported for the migration script and the signer's test
   _internal: { signedHeaders, s3Put, s3Delete, keyFor, s3Configured, bucketConfigured, S3, MIRROR }
 };

@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const path = require("path");
+const { Readable } = require("stream");
 
 const express = require("express");
 const compression = require("compression");
@@ -307,6 +308,44 @@ app.use(
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use("/public", express.static(path.join(rootDir, "public"), { maxAge: "1h" }));
+// When uploads live in a bucket the browser can't reach directly - a
+// self-hosted MinIO on a private address, or simply a private bucket - this
+// app fetches them and streams them back. Registered ahead of the static
+// handler, which stays as the fallback so files still on local disk (from
+// before a migration, or any the bucket is missing) continue to serve.
+if (storage.servesFromApp()) {
+  app.get("/uploads/:filename", async (req, res, next) => {
+    // The filename comes from the URL, so it must not be able to address
+    // anything outside the bucket's own key space. Uploads are named
+    // <timestamp>-<hex><ext> by lib/upload.js; anything else is not ours.
+    const filename = req.params.filename;
+    if (!/^[A-Za-z0-9._-]+$/.test(filename) || filename.includes("..")) {
+      return res.sendStatus(400);
+    }
+
+    let upstream;
+    try {
+      upstream = await storage.getObject(filename);
+    } catch (err) {
+      console.error(`[uploads] fetch failed for ${filename}: ${err.message}`);
+      return next(); // fall through to local disk
+    }
+
+    if (!upstream.ok) return next();
+
+    for (const header of ["content-type", "content-length", "etag", "last-modified"]) {
+      const value = upstream.headers.get(header);
+      if (value) res.setHeader(header, value);
+    }
+    // Same 7 days the static handler used. Uploads are immutable once
+    // written - the filename carries a timestamp and random suffix - so
+    // this is safe and keeps repeat views off the bucket entirely.
+    res.setHeader("Cache-Control", "public, max-age=604800");
+
+    Readable.fromWeb(upstream.body).pipe(res);
+  });
+}
+
 app.use("/uploads", express.static(uploadDir, { maxAge: "7d" }));
 
 app.use("/.well-known", wellKnownRouter);
